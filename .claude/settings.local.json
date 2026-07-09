@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//**)",
+      "Edit(//home/karl/repos/work/dialog-landingpage/**)",
+      "Write(//home/karl/repos/work/dialog-landingpage/**)",
+      "Bash(*)",
+      "WebSearch"
+    ],
+    "ask": [
+      "Bash(rm:*)",
+      "Bash(rmdir:*)",
+      "Bash(mv:*)"
+    ]
+  }
+}
