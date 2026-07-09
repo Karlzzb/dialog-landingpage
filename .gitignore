@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# 仅作取值参考的原始凭据文件（含明文密钥，须移入 .env，不入库）
+langfuse.config
+redis.conf
+
 # Python
 __pycache__/
 *.py[cod]
