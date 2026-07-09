@@ -31,6 +31,7 @@ from conftest import (
     query_capability_call,
     refine_coverage_call,
     refine_noop_call,
+    rewrite_call,
 )
 
 # 数据库假数据：某学院某专业对口率一行（数字供 raw 溯源）。
@@ -124,7 +125,7 @@ def test_layer_order_and_coverage_evolution(test_settings):
             refine_noop_call(),
             AIMessage(content="据校内统计库对口率 87.5%；另据互联网公开信息某科技营收约 1.2 亿元。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("对口率和某科技营收")],
     )
     graph = build_graph(
         models,
@@ -181,7 +182,7 @@ def test_refine_adds_unit_covered_downstream(test_settings):
             ),
             AIMessage(content="数控技术与机电技术对口率均已查到。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("机电学院对口率")],
     )
     graph = build_graph(
         models,
@@ -225,7 +226,7 @@ def test_refine_reassigns_source_match(test_settings):
             ),
             AIMessage(content="据校内数据库，对口率 87.5%。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("机电学院数控技术对口率")],
     )
     graph = build_graph(
         models,
@@ -276,7 +277,7 @@ def test_implicit_comparison_produces_analysis(test_settings):
             ),
             AIMessage(content=comparison_reply),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("这两个专业就业率")],
     )
     graph = build_graph(
         models,

@@ -66,7 +66,7 @@ def build_graph(
     checkpointer = checkpointer or MemorySaver()
 
     builder = StateGraph(TurnState)
-    builder.add_node("rewrite", make_rewrite_node())
+    builder.add_node("rewrite", make_rewrite_node(models))
     builder.add_node("react_core", make_react_core_node(models))
     builder.add_node("build_coverage", make_build_coverage_node())
     builder.add_node("retrieve_knowledge", make_retrieve_knowledge_node(knowledge_retriever))

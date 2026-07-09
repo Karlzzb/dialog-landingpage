@@ -20,7 +20,7 @@ from dialog_agent.web_search_tool import (
     FakeWebSearchBackend,
     WebSearchTool,
 )
-from conftest import make_stub_models, plan_coverage_call, query_capability_call, refine_noop_call
+from conftest import make_stub_models, plan_coverage_call, query_capability_call, refine_noop_call, rewrite_call
 
 # 联网假数据：某企业工商信息一条（数字供 raw 溯源），命中关键子串「某科技」。
 WEB_CORPUS = {
@@ -71,7 +71,7 @@ def test_external_unit_covered_with_external_search_evidence(test_settings):
             refine_noop_call(),
             AIMessage(content=final_reply),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("某科技有限公司去年营收多少？")],
     )
     graph = build_graph(
         models,
@@ -109,7 +109,7 @@ def test_external_raw_fields_fed_to_final_answer(test_settings):
             refine_noop_call(),
             AIMessage(content="结论。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("某科技营收")],
     )
     graph = build_graph(
         models,
@@ -148,7 +148,7 @@ def test_sensitive_external_content_never_reaches_llm(test_settings):
             refine_noop_call(),
             AIMessage(content="据互联网公开信息，营收约 1.2 亿元。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("某科技营收")],
     )
     graph = build_graph(
         models,
@@ -186,7 +186,7 @@ def test_blocked_external_item_dropped_no_evidence(test_settings):
             refine_noop_call(),
             AIMessage(content="抱歉，暂未检索到该企业的公开信息，建议核实名称后再试。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("某科技营收")],
     )
     graph = build_graph(
         models,
@@ -250,7 +250,7 @@ def test_external_data_isolated_from_internal_with_weak_label(test_settings):
                 )
             ),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("某科技营收和机电学院对口率")],
     )
     graph = build_graph(
         models,
@@ -307,7 +307,7 @@ def test_hit_and_stop_internal_covers_skips_external(test_settings):
             ),
             AIMessage(content="据校内统计库，对口率 87.5%。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("机电学院数控技术对口率")],
     )
     graph = build_graph(
         models,

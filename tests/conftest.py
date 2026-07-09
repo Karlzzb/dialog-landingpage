@@ -106,6 +106,40 @@ def refine_noop_call() -> AIMessage:
     return AIMessage(content="")
 
 
+def rewrite_call(
+    self_contained_query: str,
+    entities: dict | None = None,
+    *,
+    call_id: str = "call-rewrite-1",
+) -> AIMessage:
+    """构造一条发起 rewrite_query 工具调用的改写步消息（桩）。
+
+    self_contained_query 为补全后的自包含查询；entities 为本轮合并后的实体摘要
+    （如 {"地域": "武汉市", "主题": "校企合作"}）。改写步用快模型，故进入 fast 桩的响应队列。
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "rewrite_query",
+                "args": {
+                    "self_contained_query": self_contained_query,
+                    "entities": entities or {},
+                },
+                "id": call_id,
+            }
+        ],
+    )
+
+
+def rewrite_noop_call(self_contained_query: str) -> AIMessage:
+    """构造一条改写步未发起工具调用的桩消息：降级为原样透传（无 tool_calls）。
+
+    用于断言「改写降级不阻断整轮」「脏输出兜底为本轮输入」等路径。
+    """
+    return AIMessage(content=self_contained_query)
+
+
 @pytest.fixture
 def test_settings() -> Settings:
     """脱离 .env 的测试配置：无模型凭据、无 Langfuse（tracing 关闭）。"""

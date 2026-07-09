@@ -10,6 +10,7 @@ from .evidence import Evidence, SourceType
 from .graph import build_graph, invoke
 from .knowledge_tool import FakeKnowledgeRetriever, KnowledgeRetriever
 from .models import Models, build_models
+from .session_memory import SessionMemory
 from .state import TurnState
 from .web_search_tool import (
     ContentFilter,
@@ -24,6 +25,7 @@ __all__ = [
     "build_models",
     "Models",
     "TurnState",
+    "SessionMemory",
     "Evidence",
     "SourceType",
     "CoverageTable",

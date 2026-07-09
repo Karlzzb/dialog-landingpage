@@ -14,7 +14,7 @@ from dialog_agent.coverage import CoverageStatus, CoverageTable
 from dialog_agent.evidence import SourceType
 from dialog_agent.graph import build_graph, invoke
 from dialog_agent.knowledge_tool import FakeKnowledgeRetriever
-from conftest import make_stub_models, plan_coverage_call
+from conftest import make_stub_models, plan_coverage_call, rewrite_call
 
 # 知识库假语料：查询含「校企合作补贴」即命中一条带出处的 chunk。
 CORPUS = {
@@ -29,8 +29,8 @@ CORPUS = {
 }
 
 
-def _knowledge_models(final_reply: str) -> object:
-    """强模型：首步发起 plan_coverage 工具调用，末步产出结论。快模型不参与知识流。"""
+def _knowledge_models(final_reply: str, user_input: str) -> object:
+    """强模型：首步发起 plan_coverage 工具调用，末步产出结论。快模型仅做入口改写。"""
     return make_stub_models(
         strong_responses=[
             plan_coverage_call(
@@ -38,7 +38,7 @@ def _knowledge_models(final_reply: str) -> object:
             ),
             AIMessage(content=final_reply),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call(user_input)],
     )
 
 
@@ -48,7 +48,7 @@ def test_knowledge_single_unit_hit_and_answer(test_settings):
         "据武汉市产教融合政策库《校企合作补贴办法.pdf》记载，武汉市对开展校企合作的企业，"
         "按每生每年 2000 元的标准给予补贴。"
     )
-    models = _knowledge_models(final_reply)
+    models = _knowledge_models(final_reply, "武汉市校企合作补贴是多少？")
     retriever = FakeKnowledgeRetriever(CORPUS)
     graph = build_graph(models, knowledge_retriever=retriever, checkpointer=MemorySaver())
 
@@ -87,7 +87,7 @@ def test_knowledge_single_unit_hit_and_answer(test_settings):
 
 def test_knowledge_flow_evidence_prompt_reaches_final_model(test_settings):
     """结论生成步确实拿到分源 Evidence（素材结构导出来源标注，非事后质检）。"""
-    models = _knowledge_models("结论。")
+    models = _knowledge_models("结论。", "校企合作补贴标准")
     retriever = FakeKnowledgeRetriever(CORPUS)
     graph = build_graph(models, knowledge_retriever=retriever, checkpointer=MemorySaver())
 
@@ -102,7 +102,7 @@ def test_knowledge_flow_evidence_prompt_reaches_final_model(test_settings):
 
 def test_knowledge_flow_records_tool_message(test_settings):
     """知识流保留合法消息轨迹：plan_coverage 工具调用有对应 ToolMessage 回应。"""
-    models = _knowledge_models("结论。")
+    models = _knowledge_models("结论。", "校企合作补贴标准")
     graph = build_graph(
         models, knowledge_retriever=FakeKnowledgeRetriever(CORPUS), checkpointer=MemorySaver()
     )
@@ -117,7 +117,10 @@ def test_chitchat_still_bypasses_knowledge(test_settings):
     retriever = FakeKnowledgeRetriever(CORPUS)
     models = make_stub_models(
         strong_responses=[AIMessage(content="")],  # 无 tool_calls
-        fast_responses=[AIMessage(content="您好！产教融合相关问题随时为您服务。")],
+        fast_responses=[
+            rewrite_call("你好啊"),
+            AIMessage(content="您好！产教融合相关问题随时为您服务。"),
+        ],
     )
     graph = build_graph(models, knowledge_retriever=retriever, checkpointer=MemorySaver())
 

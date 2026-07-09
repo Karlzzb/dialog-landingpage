@@ -15,7 +15,7 @@ from dialog_agent.database_tool import FakeDatabaseBackend, build_default_databa
 from dialog_agent.evidence import SourceType
 from dialog_agent.graph import build_graph, invoke
 from dialog_agent.knowledge_tool import FakeKnowledgeRetriever
-from conftest import make_stub_models, plan_coverage_call, query_capability_call, refine_noop_call
+from conftest import make_stub_models, plan_coverage_call, query_capability_call, refine_noop_call, rewrite_call
 
 # 数据库假数据：某学院某专业对口率一行（数字供 raw 溯源）。
 DB_ROWS = {
@@ -53,7 +53,7 @@ def test_database_unit_covered_with_number_traceability(test_settings):
             # 结论生成。
             AIMessage(content=final_reply),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("机电学院数控技术专业实习对口率是多少？")],
     )
     # 知识库对该查询无命中（留给数据库层覆盖）。
     graph = build_graph(
@@ -96,7 +96,7 @@ def test_final_answer_prompt_carries_db_raw_fields(test_settings):
             ),
             AIMessage(content="结论。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("机电学院数控技术对口率")],
     )
     graph = build_graph(
         models,
@@ -140,7 +140,7 @@ def test_hit_and_stop_knowledge_covers_skips_database(test_settings):
             ),
             AIMessage(content="据校内统计库，对口率 87.5%。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("机电学院数控技术对口率")],
     )
     graph = build_graph(
         models,
@@ -177,7 +177,7 @@ def test_injection_param_degrades_to_blind_spot(test_settings):
             refine_noop_call(),
             AIMessage(content="抱歉，暂未查询到该专业的实习对口率数据，建议核对学院/专业名称后再试。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("查一下对口率")],
     )
     backend = FakeDatabaseBackend(DB_ROWS)
     graph = build_graph(
@@ -214,7 +214,7 @@ def test_no_matching_capability_degrades(test_settings):
             refine_noop_call(),
             AIMessage(content="暂无法查询该项数据，建议提供更具体的口径。"),
         ],
-        fast_responses=[],
+        fast_responses=[rewrite_call("查个冷门统计")],
     )
     backend = FakeDatabaseBackend(DB_ROWS)
     graph = build_graph(

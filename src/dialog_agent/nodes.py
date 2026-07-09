@@ -1,9 +1,9 @@
-"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 5：渐进检索命中即停 + 对比分析）。
+"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 6：结构化会话记忆 + 自包含查询改写）。
 
 节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具 / 联网工具，使
-`build_graph(...)` 可用桩确定性驱动。切片 5 路径：
+`build_graph(...)` 可用桩确定性驱动。切片 6 路径（在切片 5 渐进检索之上，入口接入会话记忆）：
 
-    rewrite（透传）
+    rewrite（快模型：读会话记忆→补全成自包含查询 + 合并本轮实体摘要；重置单轮消息轨迹）
       → react_core（内核首步：需事实→调 plan_coverage 产覆盖度表；纯寒暄→无工具）
           ├─(无工具)→ chat_flow_answer → finalize（≤50 字截断）
           └─(plan_coverage)→ build_coverage（解析覆盖度表）
@@ -20,16 +20,17 @@
                                         数字取自 raw；隐性对比意图产出对比分析而非仅罗列）
                                         → finalize（知识流不截断）
 
-精修步是有界的 plan-and-execute + ReAct 混合形态（ADR 0002）：结构层序与命中即停由图边保证，
-「随观察补充新单元 / 修正数据源匹配」由精修步承接，补出的单元交由后续层自然拾取。盲区/降级
-与自由 ReAct 循环 + 安全阀属后续切片沿同一覆盖度表接入。
+会话记忆是唯一跨轮载体：单轮字段（messages/coverage/evidence/final_reply）每轮入口重置，
+内核只看到本轮自包含查询，不被喂全量对话历史（ADR 0003）。精修步是有界的 plan-and-execute
++ ReAct 混合形态（ADR 0002）：结构层序与命中即停由图边保证，「随观察补充新单元 / 修正数据源
+匹配」由精修步承接。盲区/降级与自由 ReAct 循环 + 安全阀属后续切片沿同一覆盖度表接入。
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 
 from .chat_flow import CHAT_FLOW_SYSTEM_PROMPT, truncate_reply
 from .coverage import (
@@ -44,6 +45,7 @@ from .database_tool import DatabaseTool, DatabaseToolError, query_capability
 from .evidence import Evidence, SourceType
 from .knowledge_tool import KnowledgeRetriever
 from .models import Models
+from .session_memory import SessionMemory, parse_rewrite_call, rewrite_query
 from .state import TurnState
 from .web_search_tool import WebSearchTool
 
@@ -97,18 +99,65 @@ DB_CAPABILITY_SYSTEM_PROMPT = (
 )
 
 
-def make_rewrite_node() -> Callable[[TurnState], dict[str, Any]]:
-    """入口改写步。
+# 入口改写步的 system prompt（ADR 0003）：基于结构化会话记忆把用户输入补全成自包含查询。
+# 只做指代消解/省略补全，不做流程分叉（不判断走对话流还是知识流、不改变意图），故与
+# 「不设入口硬分类器」不冲突。同时产出本轮合并后的实体摘要，落回会话记忆供下一轮续接。
+REWRITE_SYSTEM_PROMPT = (
+    "你是「产教融合专家助理」的入口改写器。任务：基于会话记忆里的关键实体/约束摘要，"
+    "把用户本轮输入补全成不依赖上下文即可理解的自包含查询。"
+    "只做指代消解与省略补全，不要判断该走对话流还是知识流，不要改变用户意图，不要展开回答。"
+    "若输入已自包含，则原样返回。若输入混合寒暄与业务（如「你好，帮我查下政策」），"
+    "保留自然承接前缀、再把业务诉求补全为自包含查询。"
+    "同时给出本轮结束时应有的完整关键实体/约束摘要（合并历史与新输入，如地域/主题/专业/"
+    "时间窗口等可继承的限定词；无新实体可更新时返回历史摘要或空）。"
+)
 
-    切片 2 仍为透传（不接会话记忆）：原始输入原样作为自包含查询与内核首条消息。
-    会话记忆切片会在此基于滚动实体摘要做指代消解，接口位置不变。
+
+def make_rewrite_node(models: Models) -> Callable[[TurnState], dict[str, Any]]:
+    """入口改写步（快模型，ADR 0003）。
+
+    读 `session_memory`（上轮滚动实体摘要）作为上下文，绑 `rewrite_query` 工具调快模型，
+    一次性产出「自包含查询」与「本轮合并后的实体摘要」。写回 `rewritten_query` 与
+    `session_memory`（跨轮持久）；同时**重置单轮消息轨迹**——对上一轮残留的 messages 按 id
+    发 `RemoveMessage` 后只留本轮 `HumanMessage(自包含查询)`，落实「单轮 State 本轮用完即弃」
+    且内核不被喂全量对话历史。
+
+    改写只做指代消解、不做流程分叉：不设意图分类，流别由内核自主判定。
     """
 
     def rewrite(state: TurnState) -> dict[str, Any]:
-        user_input = state["user_input"]
+        memory = SessionMemory.from_dict(state.get("session_memory"))
+        llm = models.fast.bind_tools([rewrite_query])
+        response = llm.invoke(
+            [
+                SystemMessage(content=REWRITE_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"会话记忆（关键实体/约束摘要）：{memory.entities or '（无）'}\n"
+                        f"用户画像：{memory.user_profile or '（无）'}\n"
+                        f"用户本轮输入：{state['user_input']}"
+                    )
+                ),
+            ]
+        )
+        call = _first_rewrite_call(response)
+        if call is None:
+            # 模型未发起工具调用——降级为原样透传，记忆不变（不阻断整轮）。
+            query, entities = state["user_input"], {}
+        else:
+            query, entities = parse_rewrite_call(call["args"])
+
+        if not query:
+            query = state["user_input"]  # 脏输出兜底：绝不丢本轮输入。
+
+        updated_memory = memory.merged_with_entities(entities)
+        # 重置单轮消息轨迹：移除上一轮残留、只留本轮自包含查询。内核据此只看本轮诉求。
+        prior_ids = [m.id for m in state.get("messages", []) if getattr(m, "id", None)]
+        removals = [RemoveMessage(id=mid) for mid in prior_ids]
         return {
-            "rewritten_query": user_input,
-            "messages": [HumanMessage(content=user_input)],
+            "rewritten_query": query,
+            "session_memory": updated_memory.as_dict(),
+            "messages": [*removals, HumanMessage(content=query)],
         }
 
     return rewrite
@@ -423,6 +472,17 @@ def _first_plan_call(message: Any) -> dict[str, Any]:
             cid = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
             return {"name": name, "args": args or {}, "id": cid or ""}
     raise ValueError("内核消息中未找到 plan_coverage 工具调用")
+
+
+def _first_rewrite_call(message: Any) -> dict[str, Any] | None:
+    """取出改写步消息里的首个 rewrite_query 工具调用（规范化为 dict）；无则返回 None。"""
+    for call in getattr(message, "tool_calls", None) or []:
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+        if name == rewrite_query.__name__:
+            args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
+            cid = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
+            return {"name": name, "args": args or {}, "id": cid or ""}
+    return None
 
 
 def _first_refine_call(message: Any) -> dict[str, Any] | None:

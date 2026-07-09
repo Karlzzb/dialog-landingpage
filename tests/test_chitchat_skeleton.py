@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from dialog_agent.chat_flow import CHAT_REPLY_MAX_CHARS
 from dialog_agent.graph import build_graph, invoke
-from conftest import make_stub_models
+from conftest import make_stub_models, rewrite_call
 
 
 def _no_tool_decision() -> AIMessage:
@@ -24,7 +24,10 @@ def test_chitchat_single_turn_end_to_end(test_settings):
     chat_reply = "您好！有产教融合相关问题随时帮您查询。"
     models = make_stub_models(
         strong_responses=[_no_tool_decision()],
-        fast_responses=[AIMessage(content=chat_reply)],
+        fast_responses=[
+            rewrite_call("你好啊"),  # 入口改写：无记忆，原样透传。
+            AIMessage(content=chat_reply),
+        ],
     )
     graph = build_graph(models, checkpointer=MemorySaver())
 
@@ -45,9 +48,9 @@ def test_chitchat_single_turn_end_to_end(test_settings):
     core_decision = next(m for m in state["messages"] if isinstance(m, AIMessage))
     assert not getattr(core_decision, "tool_calls", [])
 
-    # 对话流由快模型作答，强模型仅做一次决策。
+    # 改写步（快模型）+ 对话流作答（快模型）各一次；强模型仅做一次决策。
     assert len(models.strong.invocations) == 1
-    assert len(models.fast.invocations) == 1
+    assert len(models.fast.invocations) == 2
 
 
 def test_chitchat_reply_truncated_to_50_chars(test_settings):
@@ -55,7 +58,10 @@ def test_chitchat_reply_truncated_to_50_chars(test_settings):
     long_reply = "您好呀" + "很高兴见到您" * 20  # 远超 50 字
     models = make_stub_models(
         strong_responses=[_no_tool_decision()],
-        fast_responses=[AIMessage(content=long_reply)],
+        fast_responses=[
+            rewrite_call("在吗"),
+            AIMessage(content=long_reply),
+        ],
     )
     graph = build_graph(models, checkpointer=MemorySaver())
 
@@ -68,8 +74,12 @@ def test_sessions_are_isolated_by_thread_id(test_settings):
     """不同 session_id 各走独立 thread，互不串台（会话隔离仅靠 session id 唯一性）。"""
     models = make_stub_models(
         strong_responses=[_no_tool_decision(), _no_tool_decision()],
-        fast_responses=[AIMessage(content="您好，产教融合有问必答。"),
-                        AIMessage(content="在的，产教融合随时为您服务。")],
+        fast_responses=[
+            rewrite_call("你好"),
+            AIMessage(content="您好，产教融合有问必答。"),
+            rewrite_call("在吗"),
+            AIMessage(content="在的，产教融合随时为您服务。"),
+        ],
     )
     graph = build_graph(models, checkpointer=MemorySaver())
 
