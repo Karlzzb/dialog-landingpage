@@ -45,6 +45,17 @@ def make_stub_models(*, strong_responses: list[AIMessage], fast_responses: list[
     )
 
 
+def plan_coverage_call(units: list[dict], *, call_id: str = "call-1") -> AIMessage:
+    """构造一条发起 plan_coverage 工具调用的内核决策消息（桩）。
+
+    units 形如 [{"id": "u1", "need": "...", "sources": ["INTERNAL_KNOWLEDGE"]}]。
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "plan_coverage", "args": {"units": units}, "id": call_id}],
+    )
+
+
 @pytest.fixture
 def test_settings() -> Settings:
     """脱离 .env 的测试配置：无模型凭据、无 Langfuse（tracing 关闭）。"""

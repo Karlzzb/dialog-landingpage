@@ -5,8 +5,23 @@
 
 from __future__ import annotations
 
+from .coverage import CoverageTable, InformationUnit
+from .evidence import Evidence, SourceType
 from .graph import build_graph, invoke
+from .knowledge_tool import FakeKnowledgeRetriever, KnowledgeRetriever
 from .models import Models, build_models
 from .state import TurnState
 
-__all__ = ["invoke", "build_graph", "build_models", "Models", "TurnState"]
+__all__ = [
+    "invoke",
+    "build_graph",
+    "build_models",
+    "Models",
+    "TurnState",
+    "Evidence",
+    "SourceType",
+    "CoverageTable",
+    "InformationUnit",
+    "KnowledgeRetriever",
+    "FakeKnowledgeRetriever",
+]
