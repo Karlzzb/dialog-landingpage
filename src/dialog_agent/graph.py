@@ -1,12 +1,12 @@
 """编译后的 LangGraph 图 + `invoke(session_id, user_input)` 主接缝。
 
-切片 2 拓扑（接入首个知识流路径）：
+切片 3 拓扑（知识流接入数据库层）：
 
-    START → rewrite → react_core ─(无工具)───────────────→ chat_flow_answer → finalize → END
-                          └─(plan_coverage)→ build_coverage → retrieve_knowledge → final_answer → finalize → END
+    START → rewrite → react_core ─(无工具)─────────────────────────────────→ chat_flow_answer → finalize → END
+                          └─(plan_coverage)→ build_coverage → retrieve_knowledge → retrieve_database → final_answer → finalize → END
 
-图对 `Models` 与知识库检索器 `KnowledgeRetriever` 依赖注入，可用桩确定性驱动全图；持久化
-用内存版 MemorySaver（Redis 版见切片 7）。数据库/联网层沿同一覆盖度表在后续切片接入。
+图对 `Models`、知识库检索器 `KnowledgeRetriever`、数据库工具 `DatabaseTool` 依赖注入，可用桩
+确定性驱动全图；持久化用内存版 MemorySaver（Redis 版见切片 7）。联网层沿同一覆盖度表在后续切片接入。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .config import Settings, get_settings
+from .database_tool import DatabaseTool, build_default_database_tool
 from .knowledge_tool import FakeKnowledgeRetriever, KnowledgeRetriever
 from .models import Models, build_models
 from .nodes import (
@@ -25,6 +26,7 @@ from .nodes import (
     make_final_answer_node,
     make_finalize_node,
     make_react_core_node,
+    make_retrieve_database_node,
     make_retrieve_knowledge_node,
     make_rewrite_node,
     route_after_core,
@@ -37,16 +39,19 @@ def build_graph(
     models: Models | None = None,
     *,
     knowledge_retriever: KnowledgeRetriever | None = None,
+    database_tool: DatabaseTool | None = None,
     checkpointer: Any | None = None,
 ):
     """组装并编译对话图。
 
     models：两档模型（省略则从 .env 构造真实 ChatOpenAI）。
     knowledge_retriever：知识库检索适配层（省略则用假实现打桩，检索端点到位后替换实现）。
+    database_tool：参数化查询能力集（省略则用内置能力 + 假后端打桩，真实只读库到位后替换后端）。
     checkpointer：跨轮持久化（省略则用内存版 MemorySaver）。
     """
     models = models or build_models()
     knowledge_retriever = knowledge_retriever or FakeKnowledgeRetriever()
+    database_tool = database_tool or build_default_database_tool()
     checkpointer = checkpointer or MemorySaver()
 
     builder = StateGraph(TurnState)
@@ -54,6 +59,7 @@ def build_graph(
     builder.add_node("react_core", make_react_core_node(models))
     builder.add_node("build_coverage", make_build_coverage_node())
     builder.add_node("retrieve_knowledge", make_retrieve_knowledge_node(knowledge_retriever))
+    builder.add_node("retrieve_database", make_retrieve_database_node(database_tool, models))
     builder.add_node("final_answer", make_final_answer_node(models))
     builder.add_node("chat_flow_answer", make_chat_flow_answer_node(models))
     builder.add_node("finalize", make_finalize_node())
@@ -69,9 +75,10 @@ def build_graph(
             "chat_flow_answer": "chat_flow_answer",
         },
     )
-    # 知识流：产覆盖度表 → 查知识库 → 强制作答。数据库/联网层在后续切片插在此链路上。
+    # 知识流渐进检索：产覆盖度表 → 知识库 → 数据库 → 强制作答。命中即停由各层内部按覆盖度表判定。
     builder.add_edge("build_coverage", "retrieve_knowledge")
-    builder.add_edge("retrieve_knowledge", "final_answer")
+    builder.add_edge("retrieve_knowledge", "retrieve_database")
+    builder.add_edge("retrieve_database", "final_answer")
     builder.add_edge("final_answer", "finalize")
     # 对话流出口。
     builder.add_edge("chat_flow_answer", "finalize")

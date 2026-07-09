@@ -1,17 +1,20 @@
-"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 2：接入首个知识流路径）。
+"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 3：接入数据库层）。
 
-节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器，使 `build_graph(...)` 可用桩确定性
-驱动。切片 2 路径：
+节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具，使 `build_graph(...)` 可用
+桩确定性驱动。切片 3 路径：
 
     rewrite（透传）
       → react_core（内核首步：需事实→调 plan_coverage 产覆盖度表；纯寒暄→无工具）
           ├─(无工具)→ chat_flow_answer → finalize（≤50 字截断）
           └─(plan_coverage)→ build_coverage（解析覆盖度表）
                 → retrieve_knowledge（查知识库、更新覆盖状态、累积 Evidence）
-                    → final_answer（remaining_units==0 强制作答，内部数据带来源标注）
-                        → finalize（知识流不截断）
+                    → retrieve_database（渐进检索第二层：仍缺失且候选含 DB 的单元经参数化
+                        能力集查询，命中即停不穿透；ADR 0004）
+                        → final_answer（remaining_units==0 强制作答，内外部数据带来源标注、
+                            数字取自 raw）
+                            → finalize（知识流不截断）
 
-数据库/联网层、盲区/降级路径在后续切片沿同一覆盖度表接入。
+联网层、盲区/降级路径在后续切片沿同一覆盖度表接入。
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from .coverage import (
     parse_plan_coverage,
     plan_coverage,
 )
+from .database_tool import DatabaseTool, DatabaseToolError, query_capability
 from .evidence import Evidence, SourceType
 from .knowledge_tool import KnowledgeRetriever
 from .models import Models
@@ -50,8 +54,19 @@ REACT_CORE_SYSTEM_PROMPT = (
 # 内外部隔离、来源标注、数字取自 raw —— 由素材结构 + 本 prompt 自然导出（非事后质检）。
 FINAL_ANSWER_SYSTEM_PROMPT = (
     "你是「产教融合专家助理」。以下是已检索到的分源证据。请仅依据这些证据作答，不要臆造。"
-    "内部知识库数据可直接引用，并在结论中标注其来源（文件/知识库/条款）。"
+    "内部知识库/数据库数据可直接引用，并在结论中标注其来源（文件/知识库/条款/表字段）。"
+    "涉及数字时必须取自证据的原始字段（raw），忠于原始数据、不得改写或估算。"
     "每个关键结论都要能追溯到给定证据；若证据不足以覆盖某信息单元，请坦诚说明边界，不要编造。"
+)
+
+# 数据库检索层选能力的 system prompt：内核只选已注册能力名 + 填参数，不写 SQL（ADR 0004）。
+# 参数强类型校验、只读、注入拦截在数据库工具层结构性保证；此处只负责把信息需求映射到能力调用。
+DB_CAPABILITY_SYSTEM_PROMPT = (
+    "你是「产教融合专家助理」的数据库查询编排器。"
+    "针对给定的信息需求，从可用的业务查询能力中选择恰当的一个，调用 query_capability 工具，"
+    "capability 取能力名，params 按该能力要求填写参数。"
+    "SQL 由系统写死且只读，你只需选能力与填参数，绝不要提供 SQL。"
+    "若没有任何能力匹配该需求，则不要调用工具。"
 )
 
 
@@ -137,6 +152,45 @@ def make_retrieve_knowledge_node(
     return retrieve_knowledge
 
 
+def make_retrieve_database_node(
+    database_tool: DatabaseTool,
+    models: Models,
+) -> Callable[[TurnState], dict[str, Any]]:
+    """数据库检索层（渐进检索的第二层，知识库之后）。
+
+    命中即停：仅对覆盖度表中**仍缺失**且候选源含 INTERNAL_DATABASE 的单元查数据库；若知识库
+    层已覆盖全部单元，则此层无剩余 DB 单元、直接早退（不空调模型、不向下穿透）。
+
+    每个待覆盖单元用强模型经 `query_capability` 选能力 + 填参（不写 SQL，ADR 0004），交
+    `DatabaseTool` 强类型校验后只读执行；命中则标记已覆盖并累积 `INTERNAL_DATABASE` Evidence
+    （raw 保留原始行供数字溯源）。局部降级：非法入参/无匹配能力/后端异常时放弃该单元该源，
+    loop 继续（切片 3 只有知识库+数据库两层，未覆盖单元留待结论坦诚告知边界）。
+    """
+
+    def retrieve_database(state: TurnState) -> dict[str, Any]:
+        table = CoverageTable.from_dict(state.get("coverage"))
+        pending = table.remaining_for_source(SourceType.INTERNAL_DATABASE)
+        if not pending:
+            # 命中即停：无待覆盖的数据库单元，不触发模型调用。
+            return {}
+
+        llm = models.strong.bind_tools([query_capability])
+        capabilities_desc = database_tool.describe_capabilities()
+        new_evidence: list[Evidence] = []
+        for unit in pending:
+            hits = _query_one_unit(llm, database_tool, capabilities_desc, unit.need)
+            if hits:
+                new_evidence.extend(hits)
+                table.mark_covered(unit.id, citations_of(hits))
+
+        result: dict[str, Any] = {"coverage": table.as_dict()}
+        if new_evidence:
+            result["evidence"] = [ev.as_dict() for ev in new_evidence]
+        return result
+
+    return retrieve_database
+
+
 def make_final_answer_node(models: Models) -> Callable[[TurnState], dict[str, Any]]:
     """结论生成（强制作答，强模型）。
 
@@ -204,6 +258,46 @@ def route_after_core(state: TurnState) -> str:
     return "chat_flow_answer"
 
 
+def _query_one_unit(
+    llm: Any, database_tool: DatabaseTool, capabilities_desc: str, need: str
+) -> list[Evidence]:
+    """为单个信息需求选一次能力并执行，返回该单元命中的 Evidence（失败降级为空列表）。
+
+    内核经 `query_capability` 只输出 {capability, params}；工具层做强类型校验与只读执行。
+    任何拒绝路径（无工具调用 / 非法入参 / 无匹配能力）都吞成空列表——该单元该源未覆盖，
+    交由后续层或结论坦诚告知边界，绝不外泄技术细节。
+    """
+    prompt = f"信息需求：{need}\n\n可用查询能力：\n{capabilities_desc}"
+    response = llm.invoke(
+        [
+            SystemMessage(content=DB_CAPABILITY_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+    )
+    call = _first_capability_call(response)
+    if call is None:
+        return []  # 内核判定无能力匹配（未发起工具调用）。
+    try:
+        return database_tool.run(call["capability"], call["params"])
+    except DatabaseToolError:
+        # 局部降级：非法入参/未知能力/注入被拒——放弃该单元该源，不阻断整轮。
+        return []
+
+
+def _first_capability_call(message: Any) -> dict[str, Any] | None:
+    """取出消息里的首个 query_capability 工具调用（规范化）；无则返回 None。"""
+    for call in getattr(message, "tool_calls", None) or []:
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+        if name == query_capability.__name__:
+            args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
+            args = args or {}
+            return {
+                "capability": str(args.get("capability", "")),
+                "params": args.get("params", {}) or {},
+            }
+    return None
+
+
 def _first_plan_call(message: Any) -> dict[str, Any]:
     """取出消息里的首个 plan_coverage 工具调用（规范化为 dict）。"""
     for call in getattr(message, "tool_calls", None) or []:
@@ -226,9 +320,11 @@ def _render_evidence_prompt(
     lines = [f"用户问题：{query}", "", "已检索证据："]
     if evidence:
         for ev in evidence:
-            lines.append(
-                f"- [{ev['source_type']}] {ev['content']}（来源：{ev['citation']}）"
-            )
+            line = f"- [{ev['source_type']}] {ev['content']}（来源：{ev['citation']}）"
+            # 数据库证据附原始字段，强化数字溯源：结论里的数字须取自 raw，不得改写或估算。
+            if ev["source_type"] == SourceType.INTERNAL_DATABASE.value and ev.get("raw"):
+                line += f"｜原始字段：{ev['raw']}"
+            lines.append(line)
     else:
         lines.append("（暂无证据）")
 

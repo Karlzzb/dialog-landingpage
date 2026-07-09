@@ -56,6 +56,25 @@ def plan_coverage_call(units: list[dict], *, call_id: str = "call-1") -> AIMessa
     )
 
 
+def query_capability_call(
+    capability: str, params: dict, *, call_id: str = "call-db-1"
+) -> AIMessage:
+    """构造一条发起 query_capability 工具调用的内核决策消息（桩）。
+
+    模拟数据库检索层内核选能力 + 填参：{capability, params}，不含 SQL。
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "query_capability",
+                "args": {"capability": capability, "params": params},
+                "id": call_id,
+            }
+        ],
+    )
+
+
 @pytest.fixture
 def test_settings() -> Settings:
     """脱离 .env 的测试配置：无模型凭据、无 Langfuse（tracing 关闭）。"""
