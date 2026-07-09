@@ -9,8 +9,10 @@
 
 本模块提供：
 - `plan_coverage` 结构化 schema —— 绑定强模型，内核首步以工具调用产出覆盖度表。
+- `refine_coverage` 结构化 schema —— 绑定强模型，逐层检索后随观察补充新单元 / 修正数据源匹配
+  （ADR 0002 的动态 ReAct 特性）。
 - `CoverageTable` / `InformationUnit` —— State 内的结构化对象及其更新语义。
-- `parse_plan_coverage` —— 把内核的工具调用参数解析成 `CoverageTable`。
+- `parse_plan_coverage` / `parse_refine_coverage` —— 把内核工具调用参数解析成结构化对象。
 """
 
 from __future__ import annotations
@@ -61,6 +63,35 @@ class plan_coverage(BaseModel):  # noqa: N801 —— 类名即工具名，须与
     """
 
     units: list[PlanCoverageUnit] = Field(description="信息单元清单（至少一个）")
+
+
+class ReassignOp(BaseModel):
+    """对已有信息单元修正其候选数据源匹配（精修步用）。"""
+
+    id: str = Field(description="待修正的信息单元 id（须为覆盖度表中已存在者）")
+    sources: list[str] = Field(
+        description=(
+            "修正后的候选数据源，取值 INTERNAL_KNOWLEDGE / INTERNAL_DATABASE / "
+            "EXTERNAL_SEARCH，按可信优先级排列"
+        )
+    )
+
+
+class refine_coverage(BaseModel):  # noqa: N801 —— 类名即工具名，须与领域动作一致
+    """随观察补充新信息单元或修正已有单元的数据源匹配。
+
+    逐层检索之间调用：依据已检索到的证据与仍缺失的单元，按需追加新单元（之前未识别的信息
+    需求）或修正某单元的数据源匹配（如原判走知识库、实为校内统计）。不调用则覆盖度表不变。
+    """
+
+    add_units: list[PlanCoverageUnit] = Field(
+        default_factory=list,
+        description="新观察到的、需追加覆盖的信息单元（id 须不与已有单元冲突）",
+    )
+    reassign: list[ReassignOp] = Field(
+        default_factory=list,
+        description="对已有单元修正其候选数据源匹配",
+    )
 
 
 @dataclass
@@ -131,6 +162,22 @@ class CoverageTable:
                 return
         raise KeyError(f"覆盖度表中不存在信息单元：{unit_id}")
 
+    # ── 动态精修：随观察补充新单元 / 修正数据源匹配（ADR 0002）──
+
+    def add_unit(self, unit: InformationUnit) -> None:
+        """追加一个新信息单元（随观察补充）。id 已存在则忽略，保证幂等。"""
+        if any(u.id == unit.id for u in self.units):
+            return
+        self.units.append(unit)
+
+    def reassign_sources(self, unit_id: str, sources: list[SourceType]) -> None:
+        """修正某单元的候选数据源匹配（如原判知识库、实为校内统计）。"""
+        for unit in self.units:
+            if unit.id == unit_id:
+                unit.source_matches = list(sources)
+                return
+        raise KeyError(f"覆盖度表中不存在信息单元：{unit_id}")
+
     # ── 序列化 ──
 
     def as_dict(self) -> dict[str, Any]:
@@ -164,6 +211,44 @@ def parse_plan_coverage(args: dict[str, Any]) -> CoverageTable:
             )
         )
     return CoverageTable(units=units)
+
+
+def parse_refine_coverage(
+    args: dict[str, Any]
+) -> tuple[list[InformationUnit], list[tuple[str, list[SourceType]]]]:
+    """把内核 `refine_coverage` 工具调用的参数解析成 (新增单元, 重匹配列表)。
+
+    - 新增单元：复用 `plan_coverage` 的单元解析语义（未知数据源标识忽略）。
+    - 重匹配：对每个 `{id, sources}`，把 sources 解析成 `SourceType` 列表；空列表视为不修正。
+    未知数据源标识被忽略，保证内核偶发的脏输出不阻断主体。
+    """
+    new_units: list[InformationUnit] = []
+    for raw in args.get("add_units", []):
+        source_matches: list[SourceType] = []
+        for s in raw.get("sources", []):
+            try:
+                source_matches.append(SourceType(s))
+            except ValueError:
+                continue
+        new_units.append(
+            InformationUnit(
+                id=str(raw["id"]),
+                need=str(raw["need"]),
+                source_matches=source_matches,
+            )
+        )
+
+    reassigns: list[tuple[str, list[SourceType]]] = []
+    for raw in args.get("reassign", []):
+        sources = []
+        for s in raw.get("sources", []):
+            try:
+                sources.append(SourceType(s))
+            except ValueError:
+                continue
+        if sources:
+            reassigns.append((str(raw["id"]), sources))
+    return new_units, reassigns
 
 
 def citations_of(evidence: list[Evidence]) -> list[str]:

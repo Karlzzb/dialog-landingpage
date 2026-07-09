@@ -1,12 +1,16 @@
 """编译后的 LangGraph 图 + `invoke(session_id, user_input)` 主接缝。
 
-切片 4 拓扑（知识流接入联网层，三层渐进检索齐全）：
+切片 5 拓扑（渐进检索命中即停 + 随观察精修 + 对比分析）：
 
-    START → rewrite → react_core ─(无工具)─────────────────────────────────→ chat_flow_answer → finalize → END
-                          └─(plan_coverage)→ build_coverage → retrieve_knowledge → retrieve_database → retrieve_external → final_answer → finalize → END
+    START → rewrite → react_core ─(无工具)────────────────────────────────────────────→ chat_flow_answer → finalize → END
+                          └─(plan_coverage)→ build_coverage → retrieve_knowledge → refine_after_knowledge
+                              → retrieve_database → refine_after_database → retrieve_external → final_answer → finalize → END
 
-图对 `Models`、知识库检索器 `KnowledgeRetriever`、数据库工具 `DatabaseTool`、联网工具
-`WebSearchTool` 依赖注入，可用桩确定性驱动全图；持久化用内存版 MemorySaver（Redis 版见切片 7）。
+精修步（`refine_after_knowledge` / `refine_after_database`）随观察补充新单元 / 修正数据源匹配
+（ADR 0002 动态特性），补出的单元由后续层自然拾取；命中即停（`remaining_units==0`）时精修步
+早退、不调 LLM。图对 `Models`、知识库检索器 `KnowledgeRetriever`、数据库工具 `DatabaseTool`、
+联网工具 `WebSearchTool` 依赖注入，可用桩确定性驱动全图；持久化用内存版 MemorySaver（Redis 版
+见切片 7）。
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from .nodes import (
     make_final_answer_node,
     make_finalize_node,
     make_react_core_node,
+    make_refine_coverage_node,
     make_retrieve_database_node,
     make_retrieve_external_node,
     make_retrieve_knowledge_node,
@@ -65,7 +70,13 @@ def build_graph(
     builder.add_node("react_core", make_react_core_node(models))
     builder.add_node("build_coverage", make_build_coverage_node())
     builder.add_node("retrieve_knowledge", make_retrieve_knowledge_node(knowledge_retriever))
+    builder.add_node(
+        "refine_after_knowledge", make_refine_coverage_node(models)
+    )
     builder.add_node("retrieve_database", make_retrieve_database_node(database_tool, models))
+    builder.add_node(
+        "refine_after_database", make_refine_coverage_node(models)
+    )
     builder.add_node("retrieve_external", make_retrieve_external_node(web_search_tool))
     builder.add_node("final_answer", make_final_answer_node(models))
     builder.add_node("chat_flow_answer", make_chat_flow_answer_node(models))
@@ -82,11 +93,13 @@ def build_graph(
             "chat_flow_answer": "chat_flow_answer",
         },
     )
-    # 知识流渐进检索：产覆盖度表 → 知识库 → 数据库 → 联网 → 强制作答。
-    # 命中即停由各层内部按覆盖度表判定（无待覆盖单元即早退，不向下穿透）。
+    # 知识流渐进检索：产覆盖度表 → 知识库 → 精修 → 数据库 → 精修 → 联网 → 强制作答。
+    # 命中即停由各层与精修步内部按覆盖度表判定（无待覆盖单元即早退，不向下穿透）。
     builder.add_edge("build_coverage", "retrieve_knowledge")
-    builder.add_edge("retrieve_knowledge", "retrieve_database")
-    builder.add_edge("retrieve_database", "retrieve_external")
+    builder.add_edge("retrieve_knowledge", "refine_after_knowledge")
+    builder.add_edge("refine_after_knowledge", "retrieve_database")
+    builder.add_edge("retrieve_database", "refine_after_database")
+    builder.add_edge("refine_after_database", "retrieve_external")
     builder.add_edge("retrieve_external", "final_answer")
     builder.add_edge("final_answer", "finalize")
     # 对话流出口。

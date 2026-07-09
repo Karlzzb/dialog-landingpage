@@ -20,7 +20,7 @@ from dialog_agent.web_search_tool import (
     FakeWebSearchBackend,
     WebSearchTool,
 )
-from conftest import make_stub_models, plan_coverage_call, query_capability_call
+from conftest import make_stub_models, plan_coverage_call, query_capability_call, refine_noop_call
 
 # 联网假数据：某企业工商信息一条（数字供 raw 溯源），命中关键子串「某科技」。
 WEB_CORPUS = {
@@ -66,6 +66,9 @@ def test_external_unit_covered_with_external_search_evidence(test_settings):
                     }
                 ]
             ),
+            # 知识库/数据库层均无可覆盖单元（u1 仅联网），仍缺失 → 两次精修步触发，无需精修。
+            refine_noop_call(),
+            refine_noop_call(),
             AIMessage(content=final_reply),
         ],
         fast_responses=[],
@@ -102,6 +105,8 @@ def test_external_raw_fields_fed_to_final_answer(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "某科技营收", "sources": ["EXTERNAL_SEARCH"]}]
             ),
+            refine_noop_call(),
+            refine_noop_call(),
             AIMessage(content="结论。"),
         ],
         fast_responses=[],
@@ -139,6 +144,8 @@ def test_sensitive_external_content_never_reaches_llm(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "某科技营收", "sources": ["EXTERNAL_SEARCH"]}]
             ),
+            refine_noop_call(),
+            refine_noop_call(),
             AIMessage(content="据互联网公开信息，营收约 1.2 亿元。"),
         ],
         fast_responses=[],
@@ -175,6 +182,8 @@ def test_blocked_external_item_dropped_no_evidence(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "某科技营收", "sources": ["EXTERNAL_SEARCH"]}]
             ),
+            refine_noop_call(),
+            refine_noop_call(),
             AIMessage(content="抱歉，暂未检索到该企业的公开信息，建议核实名称后再试。"),
         ],
         fast_responses=[],
@@ -225,10 +234,14 @@ def test_external_data_isolated_from_internal_with_weak_label(test_settings):
                     },
                 ]
             ),
+            # 知识库层无可覆盖单元，仍有缺失 → 精修步触发，无需精修。
+            refine_noop_call(),
             # 数据库层选能力 + 填参（u1）。
             query_capability_call(
                 "internship_placement_rate", {"college": "机电学院", "major": "数控技术"}
             ),
+            # u1 已覆盖、u2 仍缺失 → 精修步再次触发，无需精修。
+            refine_noop_call(),
             # 结论生成。
             AIMessage(
                 content=(

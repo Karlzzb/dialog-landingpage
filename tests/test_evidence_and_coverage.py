@@ -8,6 +8,7 @@ from __future__ import annotations
 from dialog_agent.coverage import (
     CoverageStatus,
     CoverageTable,
+    InformationUnit,
     citations_of,
     parse_plan_coverage,
 )
@@ -137,3 +138,71 @@ def test_citations_of_dedupes_and_drops_empty():
         Evidence(SourceType.INTERNAL_KNOWLEDGE, "d", "c2"),
     ]
     assert citations_of(evidence) == ["c1", "c2"]
+
+
+# ── 覆盖度表动态精修：补充新单元 / 修正数据源匹配（ADR 0002，切片 5）──
+
+
+def test_add_unit_appends_new_unit():
+    table = parse_plan_coverage(
+        {"units": [{"id": "u1", "need": "a", "sources": ["INTERNAL_KNOWLEDGE"]}]}
+    )
+    table.add_unit(
+        InformationUnit(id="u2", need="b", source_matches=[SourceType.INTERNAL_DATABASE])
+    )
+    assert [u.id for u in table.units] == ["u1", "u2"]
+    assert table.units[1].status == CoverageStatus.REMAINING
+
+
+def test_add_unit_is_idempotent_on_duplicate_id():
+    """已存在的 id 追加被忽略，不重复、不覆盖原单元。"""
+    table = parse_plan_coverage(
+        {"units": [{"id": "u1", "need": "原", "sources": ["INTERNAL_KNOWLEDGE"]}]}
+    )
+    table.add_unit(
+        InformationUnit(id="u1", need="新", source_matches=[SourceType.EXTERNAL_SEARCH])
+    )
+    assert len(table.units) == 1
+    assert table.units[0].need == "原"
+
+
+def test_reassign_sources_replaces_matches():
+    table = parse_plan_coverage(
+        {"units": [{"id": "u1", "need": "a", "sources": ["INTERNAL_KNOWLEDGE"]}]}
+    )
+    table.reassign_sources("u1", [SourceType.INTERNAL_DATABASE, SourceType.EXTERNAL_SEARCH])
+    assert table.units[0].source_matches == [
+        SourceType.INTERNAL_DATABASE,
+        SourceType.EXTERNAL_SEARCH,
+    ]
+    # 修正后该单元可被数据库层拾取。
+    assert table.remaining_for_source(SourceType.INTERNAL_DATABASE) == [table.units[0]]
+
+
+def test_reassign_sources_unknown_unit_raises():
+    import pytest
+
+    table = parse_plan_coverage(
+        {"units": [{"id": "u1", "need": "a", "sources": ["INTERNAL_KNOWLEDGE"]}]}
+    )
+    with pytest.raises(KeyError):
+        table.reassign_sources("nope", [SourceType.INTERNAL_DATABASE])
+
+
+def test_parse_refine_coverage_parses_add_and_reassign():
+    from dialog_agent.coverage import parse_refine_coverage
+
+    new_units, reassigns = parse_refine_coverage(
+        {
+            "add_units": [
+                {"id": "u2", "need": "b", "sources": ["INTERNAL_DATABASE", "BOGUS"]}
+            ],
+            "reassign": [
+                {"id": "u1", "sources": ["EXTERNAL_SEARCH"]},
+                {"id": "u3", "sources": ["BOGUS"]},  # 全部未知 → 视为不修正，丢弃
+            ],
+        }
+    )
+    assert len(new_units) == 1
+    assert new_units[0].source_matches == [SourceType.INTERNAL_DATABASE]
+    assert reassigns == [("u1", [SourceType.EXTERNAL_SEARCH])]

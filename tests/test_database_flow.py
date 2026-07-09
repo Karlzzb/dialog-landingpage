@@ -15,7 +15,7 @@ from dialog_agent.database_tool import FakeDatabaseBackend, build_default_databa
 from dialog_agent.evidence import SourceType
 from dialog_agent.graph import build_graph, invoke
 from dialog_agent.knowledge_tool import FakeKnowledgeRetriever
-from conftest import make_stub_models, plan_coverage_call, query_capability_call
+from conftest import make_stub_models, plan_coverage_call, query_capability_call, refine_noop_call
 
 # 数据库假数据：某学院某专业对口率一行（数字供 raw 溯源）。
 DB_ROWS = {
@@ -44,6 +44,8 @@ def test_database_unit_covered_with_number_traceability(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "机电学院数控技术实习对口率", "sources": ["INTERNAL_DATABASE"]}]
             ),
+            # 知识库层无可覆盖单元（u1 不含知识库源），仍缺失 → 精修步触发，无需精修。
+            refine_noop_call(),
             # 数据库层：选能力 + 填参。
             query_capability_call(
                 "internship_placement_rate", {"college": "机电学院", "major": "数控技术"}
@@ -88,6 +90,7 @@ def test_final_answer_prompt_carries_db_raw_fields(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "机电学院数控技术实习对口率", "sources": ["INTERNAL_DATABASE"]}]
             ),
+            refine_noop_call(),
             query_capability_call(
                 "internship_placement_rate", {"college": "机电学院", "major": "数控技术"}
             ),
@@ -163,11 +166,15 @@ def test_injection_param_degrades_to_blind_spot(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "某学院对口率", "sources": ["INTERNAL_DATABASE"]}]
             ),
+            # 知识库层无可覆盖单元，仍缺失 → 精修步触发，无需精修。
+            refine_noop_call(),
             # 注入型 college 参数：被数据库工具强类型/字符校验拒绝。
             query_capability_call(
                 "internship_placement_rate",
                 {"college": "机电学院'; DROP TABLE internship_stats; --", "major": "数控技术"},
             ),
+            # 注入被拒后该单元仍缺失 → 精修步再次触发，仍无需精修。
+            refine_noop_call(),
             AIMessage(content="抱歉，暂未查询到该专业的实习对口率数据，建议核对学院/专业名称后再试。"),
         ],
         fast_responses=[],
@@ -200,7 +207,11 @@ def test_no_matching_capability_degrades(test_settings):
             plan_coverage_call(
                 [{"id": "u1", "need": "某项无对应能力的统计", "sources": ["INTERNAL_DATABASE"]}]
             ),
+            # 知识库层无可覆盖单元，仍缺失 → 精修步触发，无需精修。
+            refine_noop_call(),
             AIMessage(content=""),  # 数据库层：无工具调用（无匹配能力）
+            # 数据库层无匹配能力 → 该单元仍缺失 → 精修步再次触发，无需精修。
+            refine_noop_call(),
             AIMessage(content="暂无法查询该项数据，建议提供更具体的口径。"),
         ],
         fast_responses=[],

@@ -1,23 +1,28 @@
-"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 4：接入联网层）。
+"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 5：渐进检索命中即停 + 对比分析）。
 
 节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具 / 联网工具，使
-`build_graph(...)` 可用桩确定性驱动。切片 4 路径：
+`build_graph(...)` 可用桩确定性驱动。切片 5 路径：
 
     rewrite（透传）
       → react_core（内核首步：需事实→调 plan_coverage 产覆盖度表；纯寒暄→无工具）
           ├─(无工具)→ chat_flow_answer → finalize（≤50 字截断）
           └─(plan_coverage)→ build_coverage（解析覆盖度表）
                 → retrieve_knowledge（查知识库、更新覆盖状态、累积 Evidence）
-                    → retrieve_database（渐进检索第二层：仍缺失且候选含 DB 的单元经参数化
-                        能力集查询，命中即停不穿透；ADR 0004）
-                        → retrieve_external（渐进检索第三层：仍缺失且候选含联网的单元查
-                            联网；边界内置 ContentFilter 清洗/拦截，原始外部文本不进 State）
-                            → final_answer（remaining_units==0 强制作答，内部直接引用、
-                                外部带「据互联网公开信息」弱化提示且与内部数据分源隔离、
-                                数字取自 raw）
-                                → finalize（知识流不截断）
+                    → refine_after_knowledge（随观察补充新单元 / 修正数据源匹配；
+                        remaining_units==0 即早退不调 LLM，保命中即停）
+                        → retrieve_database（渐进检索第二层：仍缺失且候选含 DB 的单元经参数化
+                            能力集查询，命中即停不穿透；ADR 0004）
+                            → refine_after_database（同上精修；早退保命中即停）
+                                → retrieve_external（渐进检索第三层：仍缺失且候选含联网的单元查
+                                    联网；边界内置 ContentFilter 清洗/拦截，原始外部文本不进 State）
+                                    → final_answer（remaining_units==0 强制作答，内部直接引用、
+                                        外部带「据互联网公开信息」弱化提示且与内部数据分源隔离、
+                                        数字取自 raw；隐性对比意图产出对比分析而非仅罗列）
+                                        → finalize（知识流不截断）
 
-盲区/降级路径在后续切片沿同一覆盖度表接入。
+精修步是有界的 plan-and-execute + ReAct 混合形态（ADR 0002）：结构层序与命中即停由图边保证，
+「随观察补充新单元 / 修正数据源匹配」由精修步承接，补出的单元交由后续层自然拾取。盲区/降级
+与自由 ReAct 循环 + 安全阀属后续切片沿同一覆盖度表接入。
 """
 
 from __future__ import annotations
@@ -31,7 +36,9 @@ from .coverage import (
     CoverageTable,
     citations_of,
     parse_plan_coverage,
+    parse_refine_coverage,
     plan_coverage,
+    refine_coverage,
 )
 from .database_tool import DatabaseTool, DatabaseToolError, query_capability
 from .evidence import Evidence, SourceType
@@ -55,7 +62,8 @@ REACT_CORE_SYSTEM_PROMPT = (
 )
 
 # 结论生成（强制作答）的 system prompt：关闭工具，逼模型基于 State 已有 Evidence 直接答。
-# 内外部隔离、来源标注、数字取自 raw —— 由素材结构 + 本 prompt 自然导出（非事后质检）。
+# 内外部隔离、来源标注、数字取自 raw、隐性对比产出对比分析 —— 由素材结构 + 本 prompt 自然导出
+# （非事后质检，不设独立对比分类器，与「不设入口硬分类器」一致）。
 FINAL_ANSWER_SYSTEM_PROMPT = (
     "你是「产教融合专家助理」。以下是已检索到的分源证据。请仅依据这些证据作答，不要臆造。"
     "内部知识库/数据库数据可直接引用，并在结论中标注其来源（文件/知识库/条款/表字段）。"
@@ -63,6 +71,19 @@ FINAL_ANSWER_SYSTEM_PROMPT = (
     "并自动带「据互联网公开信息」的弱化提示，不得与内部权威数据混同为确证事实。"
     "涉及数字时必须取自证据的原始字段（raw），忠于原始数据、不得改写或估算。"
     "每个关键结论都要能追溯到给定证据；若证据不足以覆盖某信息单元，请坦诚说明边界，不要编造。"
+    "当问题隐含对比意图（如「这两个专业就业率」「A 与 B 哪个更…」）时，不得仅罗列各实体数据，"
+    "须给出对比分析与可操作的结论建议，使结论可直接用于决策。"
+)
+
+# 覆盖度表精修步的 system prompt：随观察补充新单元 / 修正数据源匹配（ADR 0002 动态特性）。
+# 仅在仍存在缺失单元时触发；模型可调 refine_coverage 追加此前未识别的信息需求、或把某单元的
+# 候选数据源改成更恰当者（如原判知识库、实为校内统计）。无需精修则不调用工具。
+REFINE_COVERAGE_SYSTEM_PROMPT = (
+    "你是「产教融合专家助理」的检索规划精修器。当前覆盖度表已检索若干层，仍有信息单元缺失。"
+    "请依据已检索到的证据与仍缺失的单元判断：是否发现了此前未识别的信息需求（需追加为新单元），"
+    "或某缺失单元的候选数据源匹配有误需修正（如原判走知识库、实为校内统计则改为数据库）。"
+    "确有补充或修正时调用 refine_coverage 工具；无需精修则不要调用任何工具。"
+    "追加的新单元须能被后续层（数据库/联网）覆盖方有意义。"
 )
 
 # 数据库检索层选能力的 system prompt：内核只选已注册能力名 + 填参数，不写 SQL（ADR 0004）。
@@ -156,6 +177,59 @@ def make_retrieve_knowledge_node(
         }
 
     return retrieve_knowledge
+
+
+def make_refine_coverage_node(
+    models: Models,
+) -> Callable[[TurnState], dict[str, Any]]:
+    """覆盖度表精修步（随观察补充新单元 / 修正数据源匹配，ADR 0002）。
+
+    插在两层检索之间。命中即停时（`remaining_units` 为空）直接早退、不调 LLM，保住命中即停
+    用例的模型调用计数；仍存在缺失单元时调强模型（绑 `refine_coverage` 工具），有工具调用则
+    `add_unit` / `reassign_sources` 写回 coverage 并补一条 ToolMessage ack，无工具调用则幂等。
+    任何解析异常吞掉、原 coverage 不变（局部降级，绝不阻断整轮）。
+    """
+
+    def refine_coverage_node(state: TurnState) -> dict[str, Any]:
+        table = CoverageTable.from_dict(state.get("coverage"))
+        if table.is_complete:
+            # 命中即停：无缺失单元，精修无对象，不消耗模型调用。
+            return {}
+
+        evidence = state.get("evidence", [])
+        prompt = _render_refine_prompt(table, evidence)
+        llm = models.strong.bind_tools([refine_coverage])
+        response = llm.invoke(
+            [
+                SystemMessage(content=REFINE_COVERAGE_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ]
+        )
+        call = _first_refine_call(response)
+        if call is None:
+            # 模型判定无需精修（未发起工具调用）——幂等，不动 coverage。
+            return {"messages": [response]}
+
+        try:
+            new_units, reassigns = parse_refine_coverage(call["args"])
+            for unit in new_units:
+                table.add_unit(unit)
+            for unit_id, sources in reassigns:
+                table.reassign_sources(unit_id, sources)
+        except (KeyError, ValueError, TypeError):
+            # 脏输出降级：coverage 原样回写，不阻断整轮。
+            return {"messages": [response]}
+
+        ack = ToolMessage(
+            content=(
+                f"覆盖度表已精修：新增 {len(new_units)} 个单元、重匹配 "
+                f"{len(reassigns)} 个单元。"
+            ),
+            tool_call_id=call.get("id", ""),
+        )
+        return {"coverage": table.as_dict(), "messages": [response, ack]}
+
+    return refine_coverage_node
 
 
 def make_retrieve_database_node(
@@ -351,6 +425,17 @@ def _first_plan_call(message: Any) -> dict[str, Any]:
     raise ValueError("内核消息中未找到 plan_coverage 工具调用")
 
 
+def _first_refine_call(message: Any) -> dict[str, Any] | None:
+    """取出消息里的首个 refine_coverage 工具调用（规范化为 dict）；无则返回 None。"""
+    for call in getattr(message, "tool_calls", None) or []:
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+        if name == refine_coverage.__name__:
+            args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
+            cid = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
+            return {"name": name, "args": args or {}, "id": cid or ""}
+    return None
+
+
 def _render_evidence_prompt(
     query: str, evidence: list[dict[str, Any]], table: CoverageTable
 ) -> str:
@@ -359,6 +444,7 @@ def _render_evidence_prompt(
     Evidence 按来源标注逐条列出（content + citation），使模型作答时能直接引用并标注来源；
     外部证据显式标记为「须注明据互联网公开信息、与内部数据分源隔离」，并附清洗后的原始字段
     供数字溯源；数据库证据同样附原始字段强化数字溯源；仍缺失的单元列为盲区，导出坦诚告知边界。
+    隐性对比意图由素材结构（多实体同类数据）+ 提示导出对比分析，不设独立分类器。
     """
     lines = [f"用户问题：{query}", "", "已检索证据："]
     if evidence:
@@ -383,4 +469,44 @@ def _render_evidence_prompt(
         lines.append("")
         lines.append("仍未覆盖的信息单元（如无其他来源请坦诚说明边界）：")
         lines.extend(f"- {u.need}" for u in remaining)
+
+    # 隐性对比提示：当证据涉及多个可比实体（如两个专业各自的同类数据）时，引导产出对比分析
+    # 而非并列罗列。判定为「多实体同类」即提示；对比意图的最终判定由模型依 query + 素材完成。
+    if _looks_comparative(query, evidence):
+        lines.append("")
+        lines.append("该问题隐含对比意图：结论须给出对比分析与决策建议，不得仅并列罗列各实体数据。")
+    return "\n".join(lines)
+
+
+def _looks_comparative(query: str, evidence: list[dict[str, Any]]) -> bool:
+    """粗筛对比意图：query 含对比词，或同源证据含多个可比实体。
+
+    只作「是否提示对比」的廉价启发式，不替代模型判断；命中即给提示，漏判不损正确性。
+    """
+    comparative_hints = ("对比", "哪个", "哪个更", "这两个", "这两个专业", "比较", "谁更", "相差")
+    if any(hint in query for hint in comparative_hints):
+        return True
+    # 同一数据源 ≥2 条证据，且其 content 含可区分实体（仅作粗筛：同源多条即提示）。
+    by_source: dict[str, int] = {}
+    for ev in evidence:
+        by_source[ev.get("source_type", "")] = by_source.get(ev.get("source_type", ""), 0) + 1
+    return any(count >= 2 for count in by_source.values())
+
+
+def _render_refine_prompt(table: CoverageTable, evidence: list[dict[str, Any]]) -> str:
+    """把仍缺失的单元 + 已检索证据摘要渲染成精修步的输入。
+
+    仅列出仍缺失单元（精修对象）与已有证据摘要（供模型判断是否需补单元 / 改匹配），不重复
+    已覆盖单元。模型据此决定调用 refine_coverage 或不调。
+    """
+    lines = ["当前仍缺失的信息单元（精修对象）："]
+    for unit in table.remaining_units:
+        lines.append(f"- {unit.id}：{unit.need}｜候选源：{unit.source_matches}")
+    lines.append("")
+    lines.append("已检索证据摘要：")
+    if evidence:
+        for ev in evidence:
+            lines.append(f"- [{ev['source_type']}] {ev['content']}（来源：{ev['citation']}）")
+    else:
+        lines.append("（暂无证据）")
     return "\n".join(lines)

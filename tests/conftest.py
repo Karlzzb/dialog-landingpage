@@ -75,6 +75,37 @@ def query_capability_call(
     )
 
 
+def refine_coverage_call(
+    *,
+    add_units: list[dict] | None = None,
+    reassign: list[dict] | None = None,
+    call_id: str = "call-refine-1",
+) -> AIMessage:
+    """构造一条发起 refine_coverage 工具调用的精修步消息（桩）。
+
+    add_units 形如 [{"id": "u2", "need": "...", "sources": ["INTERNAL_DATABASE"]}]；
+    reassign 形如 [{"id": "u1", "sources": ["INTERNAL_DATABASE"]}]。
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "refine_coverage",
+                "args": {
+                    "add_units": add_units or [],
+                    "reassign": reassign or [],
+                },
+                "id": call_id,
+            }
+        ],
+    )
+
+
+def refine_noop_call() -> AIMessage:
+    """构造一条精修步「无需精修」的桩消息：无工具调用，覆盖度表不变。"""
+    return AIMessage(content="")
+
+
 @pytest.fixture
 def test_settings() -> Settings:
     """脱离 .env 的测试配置：无模型凭据、无 Langfuse（tracing 关闭）。"""
