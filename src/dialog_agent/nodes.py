@@ -1,7 +1,7 @@
-"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 3：接入数据库层）。
+"""图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 4：接入联网层）。
 
-节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具，使 `build_graph(...)` 可用
-桩确定性驱动。切片 3 路径：
+节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具 / 联网工具，使
+`build_graph(...)` 可用桩确定性驱动。切片 4 路径：
 
     rewrite（透传）
       → react_core（内核首步：需事实→调 plan_coverage 产覆盖度表；纯寒暄→无工具）
@@ -10,11 +10,14 @@
                 → retrieve_knowledge（查知识库、更新覆盖状态、累积 Evidence）
                     → retrieve_database（渐进检索第二层：仍缺失且候选含 DB 的单元经参数化
                         能力集查询，命中即停不穿透；ADR 0004）
-                        → final_answer（remaining_units==0 强制作答，内外部数据带来源标注、
-                            数字取自 raw）
-                            → finalize（知识流不截断）
+                        → retrieve_external（渐进检索第三层：仍缺失且候选含联网的单元查
+                            联网；边界内置 ContentFilter 清洗/拦截，原始外部文本不进 State）
+                            → final_answer（remaining_units==0 强制作答，内部直接引用、
+                                外部带「据互联网公开信息」弱化提示且与内部数据分源隔离、
+                                数字取自 raw）
+                                → finalize（知识流不截断）
 
-联网层、盲区/降级路径在后续切片沿同一覆盖度表接入。
+盲区/降级路径在后续切片沿同一覆盖度表接入。
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from .evidence import Evidence, SourceType
 from .knowledge_tool import KnowledgeRetriever
 from .models import Models
 from .state import TurnState
+from .web_search_tool import WebSearchTool
 
 # 流别标识：finalize 据此决定是否对回复做 ≤50 字截断。
 FLOW_CHAT = "chat"
@@ -55,6 +59,8 @@ REACT_CORE_SYSTEM_PROMPT = (
 FINAL_ANSWER_SYSTEM_PROMPT = (
     "你是「产教融合专家助理」。以下是已检索到的分源证据。请仅依据这些证据作答，不要臆造。"
     "内部知识库/数据库数据可直接引用，并在结论中标注其来源（文件/知识库/条款/表字段）。"
+    "外部联网数据（EXTERNAL_SEARCH）必须与内部数据严格分源隔离呈现，"
+    "并自动带「据互联网公开信息」的弱化提示，不得与内部权威数据混同为确证事实。"
     "涉及数字时必须取自证据的原始字段（raw），忠于原始数据、不得改写或估算。"
     "每个关键结论都要能追溯到给定证据；若证据不足以覆盖某信息单元，请坦诚说明边界，不要编造。"
 )
@@ -191,6 +197,42 @@ def make_retrieve_database_node(
     return retrieve_database
 
 
+def make_retrieve_external_node(
+    web_tool: WebSearchTool,
+) -> Callable[[TurnState], dict[str, Any]]:
+    """联网检索层（渐进检索的第三层、最末层，数据库之后）。
+
+    命中即停：仅对覆盖度表中**仍缺失**且候选源含 EXTERNAL_SEARCH 的单元查联网；若更高层
+    （知识库/数据库）已覆盖全部单元，则此层无剩余外部单元、直接早退（不空调、不向下穿透）。
+
+    外部内容在工具边界已被 `WebSearchTool` 内置的 `ContentFilter` 清洗/拦截，进 State 的
+    Evidence.content 与 raw 均为脱敏副本，**原始外部文本绝不喂 LLM**（ADR 0007 数据层职责）。
+    命中则标记已覆盖并累积 `EXTERNAL_SEARCH` Evidence（raw 保留清洗后字段供数字溯源）。
+    未命中的单元保持缺失，由结论生成坦诚告知边界（盲区）。
+    """
+
+    def retrieve_external(state: TurnState) -> dict[str, Any]:
+        table = CoverageTable.from_dict(state.get("coverage"))
+        pending = table.remaining_for_source(SourceType.EXTERNAL_SEARCH)
+        if not pending:
+            # 命中即停：无待覆盖的外部单元，不触发联网检索。
+            return {}
+
+        new_evidence: list[Evidence] = []
+        for unit in pending:
+            hits = web_tool.search(unit.need)
+            if hits:
+                new_evidence.extend(hits)
+                table.mark_covered(unit.id, citations_of(hits))
+
+        result: dict[str, Any] = {"coverage": table.as_dict()}
+        if new_evidence:
+            result["evidence"] = [ev.as_dict() for ev in new_evidence]
+        return result
+
+    return retrieve_external
+
+
 def make_final_answer_node(models: Models) -> Callable[[TurnState], dict[str, Any]]:
     """结论生成（强制作答，强模型）。
 
@@ -315,16 +357,24 @@ def _render_evidence_prompt(
     """把自包含查询 + 分源 Evidence + 覆盖状态渲染成结论生成的输入。
 
     Evidence 按来源标注逐条列出（content + citation），使模型作答时能直接引用并标注来源；
-    仍缺失的信息单元显式列为盲区提示，导出坦诚告知边界的行为。
+    外部证据显式标记为「须注明据互联网公开信息、与内部数据分源隔离」，并附清洗后的原始字段
+    供数字溯源；数据库证据同样附原始字段强化数字溯源；仍缺失的单元列为盲区，导出坦诚告知边界。
     """
     lines = [f"用户问题：{query}", "", "已检索证据："]
     if evidence:
         for ev in evidence:
             line = f"- [{ev['source_type']}] {ev['content']}（来源：{ev['citation']}）"
-            # 数据库证据附原始字段，强化数字溯源：结论里的数字须取自 raw，不得改写或估算。
-            if ev["source_type"] == SourceType.INTERNAL_DATABASE.value and ev.get("raw"):
-                line += f"｜原始字段：{ev['raw']}"
-            lines.append(line)
+            if ev["source_type"] == SourceType.EXTERNAL_SEARCH.value:
+                # 外部数据：弱化提示 + 内外部隔离 + 数字取自 raw（已脱敏）。
+                line += "｜外部数据：结论中须注明「据互联网公开信息」，与内部数据分源隔离呈现"
+                if ev.get("raw"):
+                    line += f"｜原始字段：{ev['raw']}"
+                lines.append(line)
+            elif ev["source_type"] == SourceType.INTERNAL_DATABASE.value and ev.get("raw"):
+                # 数据库证据附原始字段，强化数字溯源：结论里的数字须取自 raw，不得改写或估算。
+                lines.append(f"{line}｜原始字段：{ev['raw']}")
+            else:
+                lines.append(line)
     else:
         lines.append("（暂无证据）")
 

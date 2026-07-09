@@ -1,12 +1,12 @@
 """编译后的 LangGraph 图 + `invoke(session_id, user_input)` 主接缝。
 
-切片 3 拓扑（知识流接入数据库层）：
+切片 4 拓扑（知识流接入联网层，三层渐进检索齐全）：
 
     START → rewrite → react_core ─(无工具)─────────────────────────────────→ chat_flow_answer → finalize → END
-                          └─(plan_coverage)→ build_coverage → retrieve_knowledge → retrieve_database → final_answer → finalize → END
+                          └─(plan_coverage)→ build_coverage → retrieve_knowledge → retrieve_database → retrieve_external → final_answer → finalize → END
 
-图对 `Models`、知识库检索器 `KnowledgeRetriever`、数据库工具 `DatabaseTool` 依赖注入，可用桩
-确定性驱动全图；持久化用内存版 MemorySaver（Redis 版见切片 7）。联网层沿同一覆盖度表在后续切片接入。
+图对 `Models`、知识库检索器 `KnowledgeRetriever`、数据库工具 `DatabaseTool`、联网工具
+`WebSearchTool` 依赖注入，可用桩确定性驱动全图；持久化用内存版 MemorySaver（Redis 版见切片 7）。
 """
 
 from __future__ import annotations
@@ -27,12 +27,14 @@ from .nodes import (
     make_finalize_node,
     make_react_core_node,
     make_retrieve_database_node,
+    make_retrieve_external_node,
     make_retrieve_knowledge_node,
     make_rewrite_node,
     route_after_core,
 )
 from .observability import build_langfuse_callbacks
 from .state import TurnState
+from .web_search_tool import WebSearchTool, build_default_web_search_tool
 
 
 def build_graph(
@@ -40,6 +42,7 @@ def build_graph(
     *,
     knowledge_retriever: KnowledgeRetriever | None = None,
     database_tool: DatabaseTool | None = None,
+    web_search_tool: WebSearchTool | None = None,
     checkpointer: Any | None = None,
 ):
     """组装并编译对话图。
@@ -47,11 +50,14 @@ def build_graph(
     models：两档模型（省略则从 .env 构造真实 ChatOpenAI）。
     knowledge_retriever：知识库检索适配层（省略则用假实现打桩，检索端点到位后替换实现）。
     database_tool：参数化查询能力集（省略则用内置能力 + 假后端打桩，真实只读库到位后替换后端）。
+    web_search_tool：联网工具（省略则用假后端 + 默认空词表过滤器打桩，真实检索后端/合规词表
+        到位后注入）。
     checkpointer：跨轮持久化（省略则用内存版 MemorySaver）。
     """
     models = models or build_models()
     knowledge_retriever = knowledge_retriever or FakeKnowledgeRetriever()
     database_tool = database_tool or build_default_database_tool()
+    web_search_tool = web_search_tool or build_default_web_search_tool()
     checkpointer = checkpointer or MemorySaver()
 
     builder = StateGraph(TurnState)
@@ -60,6 +66,7 @@ def build_graph(
     builder.add_node("build_coverage", make_build_coverage_node())
     builder.add_node("retrieve_knowledge", make_retrieve_knowledge_node(knowledge_retriever))
     builder.add_node("retrieve_database", make_retrieve_database_node(database_tool, models))
+    builder.add_node("retrieve_external", make_retrieve_external_node(web_search_tool))
     builder.add_node("final_answer", make_final_answer_node(models))
     builder.add_node("chat_flow_answer", make_chat_flow_answer_node(models))
     builder.add_node("finalize", make_finalize_node())
@@ -75,10 +82,12 @@ def build_graph(
             "chat_flow_answer": "chat_flow_answer",
         },
     )
-    # 知识流渐进检索：产覆盖度表 → 知识库 → 数据库 → 强制作答。命中即停由各层内部按覆盖度表判定。
+    # 知识流渐进检索：产覆盖度表 → 知识库 → 数据库 → 联网 → 强制作答。
+    # 命中即停由各层内部按覆盖度表判定（无待覆盖单元即早退，不向下穿透）。
     builder.add_edge("build_coverage", "retrieve_knowledge")
     builder.add_edge("retrieve_knowledge", "retrieve_database")
-    builder.add_edge("retrieve_database", "final_answer")
+    builder.add_edge("retrieve_database", "retrieve_external")
+    builder.add_edge("retrieve_external", "final_answer")
     builder.add_edge("final_answer", "finalize")
     # 对话流出口。
     builder.add_edge("chat_flow_answer", "finalize")

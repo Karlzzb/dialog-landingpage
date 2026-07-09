@@ -11,6 +11,12 @@ from .graph import build_graph, invoke
 from .knowledge_tool import FakeKnowledgeRetriever, KnowledgeRetriever
 from .models import Models, build_models
 from .state import TurnState
+from .web_search_tool import (
+    ContentFilter,
+    FakeWebSearchBackend,
+    WebSearchBackend,
+    WebSearchTool,
+)
 
 __all__ = [
     "invoke",
@@ -24,4 +30,8 @@ __all__ = [
     "InformationUnit",
     "KnowledgeRetriever",
     "FakeKnowledgeRetriever",
+    "WebSearchBackend",
+    "WebSearchTool",
+    "FakeWebSearchBackend",
+    "ContentFilter",
 ]

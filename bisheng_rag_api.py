@@ -162,7 +162,7 @@ def interactive_config(file_path):
             separator = ["\n\n"]
             separator_rule = ["after"]
         else:
-            print(f"⏳ 正在读取文件并提取匹配项...")
+            print("⏳ 正在读取文件并提取匹配项...")
             content = read_file_text(file_path)
             if content is None:
                 print("⚠️ 读取文件失败，回退到默认分隔符")
@@ -195,7 +195,7 @@ def interactive_config(file_path):
                     print(f"✅ 正则提取到 {len(separator)} 个分隔符: {separator[:10]}{'...' if len(separator)>10 else ''}")
 
     print("\n" + "-" * 30)
-    print(f"✅ 最终参数：")
+    print("✅ 最终参数：")
     print(f"   chunk_size = {chunk_size}")
     print(f"   chunk_overlap = {chunk_overlap}")
     print(f"   separator = {separator}")
