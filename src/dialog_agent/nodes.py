@@ -1,6 +1,6 @@
 """图节点 —— 确定性骨架的入口/出口 + ReAct 内核（切片 6：结构化会话记忆 + 自包含查询改写）。
 
-节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具 / 联网工具，使
+节点均为闭包工厂，绑定注入的 `Models` / 知识库检索器 / 数据库工具 / 联网工具 / `SafetyCaps`，使
 `build_graph(...)` 可用桩确定性驱动。切片 6 路径（在切片 5 渐进检索之上，入口接入会话记忆）：
 
     rewrite（快模型：读会话记忆→补全成自包含查询 + 合并本轮实体摘要；重置单轮消息轨迹）
@@ -17,13 +17,23 @@
                                     联网；边界内置 ContentFilter 清洗/拦截，原始外部文本不进 State）
                                     → final_answer（remaining_units==0 强制作答，内部直接引用、
                                         外部带「据互联网公开信息」弱化提示且与内部数据分源隔离、
-                                        数字取自 raw；隐性对比意图产出对比分析而非仅罗列）
-                                        → finalize（知识流不截断）
+                                        数字取自 raw；隐性对比意图产出对比分析而非仅罗列；
+                                        仍 REMAINING 的单元标记为盲区，坦诚告知边界并给下一步指引）
 
-会话记忆是唯一跨轮载体：单轮字段（messages/coverage/evidence/final_reply）每轮入口重置，
+切片 8 在此管线接入另两条 loop 退出路径 + 全局兜底（覆盖完成路径已在切片 5）：
+- 盲区：final_answer 入口把所有仍 REMAINING 的单元标记为 BLIND_SPOT（一等状态，非异常），
+  结论坦诚告知边界 + 给下一步指引 + 不编造。final_answer 是唯一终止点，故无论从覆盖完成 /
+  安全阀 / 穷尽哪条路径到达都会标记。
+- 安全阀：检索/精修节点各计一步 iteration_count、每次工具调用计一步 tool_call_count；触顶
+  （max_tool_calls / max_iterations，.env 可配）即经 `make_safety_route` 条件边短路到 final_answer
+  兜底强制作答，未取到的单元落盲区。当前有界管线正常一轮≤5 迭代、≤6 工具调用，默认阈值不触顶。
+- 优雅兜底：`invoke` 外层 try/except 捕获任意异常 → 人性化固定话术（见 safety.FALLBACK_REPLY），
+  技术堆栈绝不外泄（异常细节仅落运维日志）。
+
+会话记忆是唯一跨轮载体：单轮字段（messages/coverage/evidence/final_reply/计数）每轮入口重置，
 内核只看到本轮自包含查询，不被喂全量对话历史（ADR 0003）。精修步是有界的 plan-and-execute
 + ReAct 混合形态（ADR 0002）：结构层序与命中即停由图边保证，「随观察补充新单元 / 修正数据源
-匹配」由精修步承接。盲区/降级与自由 ReAct 循环 + 安全阀属后续切片沿同一覆盖度表接入。
+匹配」由精修步承接。自由 ReAct 回边循环属后续切片沿同一覆盖度表接入（max_iterations 作其兜底）。
 """
 
 from __future__ import annotations
@@ -45,6 +55,7 @@ from .database_tool import DatabaseTool, DatabaseToolError, query_capability
 from .evidence import Evidence, SourceType
 from .knowledge_tool import KnowledgeRetriever
 from .models import Models
+from .safety import SafetyCaps, safety_valve_tripped
 from .session_memory import SessionMemory, parse_rewrite_call, rewrite_query
 from .state import TurnState
 from .web_search_tool import WebSearchTool
@@ -64,8 +75,9 @@ REACT_CORE_SYSTEM_PROMPT = (
 )
 
 # 结论生成（强制作答）的 system prompt：关闭工具，逼模型基于 State 已有 Evidence 直接答。
-# 内外部隔离、来源标注、数字取自 raw、隐性对比产出对比分析 —— 由素材结构 + 本 prompt 自然导出
-# （非事后质检，不设独立对比分类器，与「不设入口硬分类器」一致）。
+# 内外部隔离、来源标注、数字取自 raw、隐性对比产出对比分析、盲区坦诚告知边界+给指引
+# —— 由素材结构 + 本 prompt 自然导出（非事后质检，不设独立对比/盲区分类器，与「不设入口硬
+# 分类器」一致）。
 FINAL_ANSWER_SYSTEM_PROMPT = (
     "你是「产教融合专家助理」。以下是已检索到的分源证据。请仅依据这些证据作答，不要臆造。"
     "内部知识库/数据库数据可直接引用，并在结论中标注其来源（文件/知识库/条款/表字段）。"
@@ -75,6 +87,9 @@ FINAL_ANSWER_SYSTEM_PROMPT = (
     "每个关键结论都要能追溯到给定证据；若证据不足以覆盖某信息单元，请坦诚说明边界，不要编造。"
     "当问题隐含对比意图（如「这两个专业就业率」「A 与 B 哪个更…」）时，不得仅罗列各实体数据，"
     "须给出对比分析与可操作的结论建议，使结论可直接用于决策。"
+    "对于标记为盲区（BLIND_SPOT）的信息单元，必须在结论中明确说明「该信息当前未能查到」，"
+    "并给出补救方向与下一步指引（如建议换关键词重试、联系校内相关业务部门核实、或核实实体名称"
+    "后再问），绝不编造数据填充盲区。"
 )
 
 # 覆盖度表精修步的 system prompt：随观察补充新单元 / 修正数据源匹配（ADR 0002 动态特性）。
@@ -204,32 +219,46 @@ def make_build_coverage_node() -> Callable[[TurnState], dict[str, Any]]:
 
 def make_retrieve_knowledge_node(
     retriever: KnowledgeRetriever,
+    caps: SafetyCaps,
 ) -> Callable[[TurnState], dict[str, Any]]:
     """知识库检索层（渐进检索的第一层）。
 
     对覆盖度表中仍缺失、且候选源含 INTERNAL_KNOWLEDGE 的每个信息单元查知识库；命中则把该
     单元标记为已覆盖并记录来源标注，Evidence 追加进 State（分源累积）。未命中的单元保持缺失
-    （留待后续层，切片 2 只有此一层）。
+    （留待后续层）。
+
+    安全阀（切片 8）：节点入口计一步 iteration_count；per-unit 循环内每次工具调用计一步
+    tool_call_count，达 `max_tool_calls` 即 break 停止本层后续查询（由条件边短路到 final_answer）。
     """
 
     def retrieve_knowledge(state: TurnState) -> dict[str, Any]:
         table = CoverageTable.from_dict(state.get("coverage"))
+        tool_calls = state.get("tool_call_count", 0)
+        iterations = state.get("iteration_count", 0) + 1
         new_evidence: list[Evidence] = []
         for unit in table.remaining_for_source(SourceType.INTERNAL_KNOWLEDGE):
+            if safety_valve_tripped(tool_calls, iterations, caps):
+                break  # 安全阀：停止本层后续查询，交由条件边短路到 final_answer 强制作答。
             hits = retriever.retrieve(unit.need)
+            tool_calls += 1
             if hits:
                 new_evidence.extend(hits)
                 table.mark_covered(unit.id, citations_of(hits))
-        return {
+        result: dict[str, Any] = {
             "coverage": table.as_dict(),
-            "evidence": [ev.as_dict() for ev in new_evidence],
+            "tool_call_count": tool_calls,
+            "iteration_count": iterations,
         }
+        if new_evidence:
+            result["evidence"] = [ev.as_dict() for ev in new_evidence]
+        return result
 
     return retrieve_knowledge
 
 
 def make_refine_coverage_node(
     models: Models,
+    caps: SafetyCaps,
 ) -> Callable[[TurnState], dict[str, Any]]:
     """覆盖度表精修步（随观察补充新单元 / 修正数据源匹配，ADR 0002）。
 
@@ -237,13 +266,22 @@ def make_refine_coverage_node(
     用例的模型调用计数；仍存在缺失单元时调强模型（绑 `refine_coverage` 工具），有工具调用则
     `add_unit` / `reassign_sources` 写回 coverage 并补一条 ToolMessage ack，无工具调用则幂等。
     任何解析异常吞掉、原 coverage 不变（局部降级，绝不阻断整轮）。
+
+    安全阀（切片 8）：节点入口计一步 iteration_count；命中即停早退仍计该步；若安全阀已触顶则
+    不调 LLM、原样返回（由条件边短路到 final_answer），省一次模型调用。
     """
 
     def refine_coverage_node(state: TurnState) -> dict[str, Any]:
         table = CoverageTable.from_dict(state.get("coverage"))
+        tool_calls = state.get("tool_call_count", 0)
+        iterations = state.get("iteration_count", 0) + 1
         if table.is_complete:
-            # 命中即停：无缺失单元，精修无对象，不消耗模型调用。
-            return {}
+            # 命中即停：无缺失单元，精修无对象，不消耗模型调用（仍计一步迭代）。
+            return {"iteration_count": iterations}
+
+        if safety_valve_tripped(tool_calls, iterations, caps):
+            # 安全阀：不再调 LLM 精修，交由条件边短路到 final_answer 强制作答。
+            return {"iteration_count": iterations}
 
         evidence = state.get("evidence", [])
         prompt = _render_refine_prompt(table, evidence)
@@ -257,7 +295,7 @@ def make_refine_coverage_node(
         call = _first_refine_call(response)
         if call is None:
             # 模型判定无需精修（未发起工具调用）——幂等，不动 coverage。
-            return {"messages": [response]}
+            return {"messages": [response], "iteration_count": iterations}
 
         try:
             new_units, reassigns = parse_refine_coverage(call["args"])
@@ -267,7 +305,7 @@ def make_refine_coverage_node(
                 table.reassign_sources(unit_id, sources)
         except (KeyError, ValueError, TypeError):
             # 脏输出降级：coverage 原样回写，不阻断整轮。
-            return {"messages": [response]}
+            return {"messages": [response], "iteration_count": iterations}
 
         ack = ToolMessage(
             content=(
@@ -276,7 +314,11 @@ def make_refine_coverage_node(
             ),
             tool_call_id=call.get("id", ""),
         )
-        return {"coverage": table.as_dict(), "messages": [response, ack]}
+        return {
+            "coverage": table.as_dict(),
+            "messages": [response, ack],
+            "iteration_count": iterations,
+        }
 
     return refine_coverage_node
 
@@ -284,6 +326,7 @@ def make_refine_coverage_node(
 def make_retrieve_database_node(
     database_tool: DatabaseTool,
     models: Models,
+    caps: SafetyCaps,
 ) -> Callable[[TurnState], dict[str, Any]]:
     """数据库检索层（渐进检索的第二层，知识库之后）。
 
@@ -294,25 +337,37 @@ def make_retrieve_database_node(
     `DatabaseTool` 强类型校验后只读执行；命中则标记已覆盖并累积 `INTERNAL_DATABASE` Evidence
     （raw 保留原始行供数字溯源）。局部降级：非法入参/无匹配能力/后端异常时放弃该单元该源，
     loop 继续（切片 3 只有知识库+数据库两层，未覆盖单元留待结论坦诚告知边界）。
+
+    安全阀（切片 8）：节点入口计一步 iteration_count；per-unit 循环内每次能力调用计一步
+    tool_call_count，达 `max_tool_calls` 即 break 停止后续查询（由条件边短路到 final_answer）。
     """
 
     def retrieve_database(state: TurnState) -> dict[str, Any]:
         table = CoverageTable.from_dict(state.get("coverage"))
         pending = table.remaining_for_source(SourceType.INTERNAL_DATABASE)
+        tool_calls = state.get("tool_call_count", 0)
+        iterations = state.get("iteration_count", 0) + 1
         if not pending:
-            # 命中即停：无待覆盖的数据库单元，不触发模型调用。
-            return {}
+            # 命中即停：无待覆盖的数据库单元，不触发模型调用（仍计一步迭代）。
+            return {"tool_call_count": tool_calls, "iteration_count": iterations}
 
         llm = models.strong.bind_tools([query_capability])
         capabilities_desc = database_tool.describe_capabilities()
         new_evidence: list[Evidence] = []
         for unit in pending:
+            if safety_valve_tripped(tool_calls, iterations, caps):
+                break  # 安全阀：停止本层后续查询，交由条件边短路到 final_answer 强制作答。
             hits = _query_one_unit(llm, database_tool, capabilities_desc, unit.need)
+            tool_calls += 1
             if hits:
                 new_evidence.extend(hits)
                 table.mark_covered(unit.id, citations_of(hits))
 
-        result: dict[str, Any] = {"coverage": table.as_dict()}
+        result: dict[str, Any] = {
+            "coverage": table.as_dict(),
+            "tool_call_count": tool_calls,
+            "iteration_count": iterations,
+        }
         if new_evidence:
             result["evidence"] = [ev.as_dict() for ev in new_evidence]
         return result
@@ -322,6 +377,7 @@ def make_retrieve_database_node(
 
 def make_retrieve_external_node(
     web_tool: WebSearchTool,
+    caps: SafetyCaps,
 ) -> Callable[[TurnState], dict[str, Any]]:
     """联网检索层（渐进检索的第三层、最末层，数据库之后）。
 
@@ -332,23 +388,31 @@ def make_retrieve_external_node(
     Evidence.content 与 raw 均为脱敏副本，**原始外部文本绝不喂 LLM**（ADR 0007 数据层职责）。
     命中则标记已覆盖并累积 `EXTERNAL_SEARCH` Evidence（raw 保留清洗后字段供数字溯源）。
     未命中的单元保持缺失，由结论生成坦诚告知边界（盲区）。
+
+    安全阀（切片 8）：节点入口计一步 iteration_count；per-unit 循环内每次联网调用计一步
+    tool_call_count，达 `max_tool_calls` 即 break 停止后续查询。本层为最末层，其后即 final_answer
+    （故无单独条件边短路，但仍守上限避免末层自身过载）。
     """
 
     def retrieve_external(state: TurnState) -> dict[str, Any]:
         table = CoverageTable.from_dict(state.get("coverage"))
-        pending = table.remaining_for_source(SourceType.EXTERNAL_SEARCH)
-        if not pending:
-            # 命中即停：无待覆盖的外部单元，不触发联网检索。
-            return {}
-
+        tool_calls = state.get("tool_call_count", 0)
+        iterations = state.get("iteration_count", 0) + 1
         new_evidence: list[Evidence] = []
-        for unit in pending:
+        for unit in table.remaining_for_source(SourceType.EXTERNAL_SEARCH):
+            if safety_valve_tripped(tool_calls, iterations, caps):
+                break  # 安全阀：停止本层后续查询，直接进 final_answer 强制作答。
             hits = web_tool.search(unit.need)
+            tool_calls += 1
             if hits:
                 new_evidence.extend(hits)
                 table.mark_covered(unit.id, citations_of(hits))
 
-        result: dict[str, Any] = {"coverage": table.as_dict()}
+        result: dict[str, Any] = {
+            "coverage": table.as_dict(),
+            "tool_call_count": tool_calls,
+            "iteration_count": iterations,
+        }
         if new_evidence:
             result["evidence"] = [ev.as_dict() for ev in new_evidence]
         return result
@@ -361,11 +425,18 @@ def make_final_answer_node(models: Models) -> Callable[[TurnState], dict[str, An
 
     loop 终止时的终止动作：关闭工具调用，逼模型基于 State 已累积的分源 Evidence 直接作答。
     内部数据直接引用并带来源标注、数字取自 raw —— 由素材结构 + prompt 导出。
+
+    盲区（切片 8）：final_answer 是 loop 的唯一终止点，入口把所有仍 REMAINING 的单元标记为
+    BLIND_SPOT（一等状态，非异常）——无论从覆盖完成 / 安全阀 / 穷尽哪条路径到达都会标记。
+    据此在 prompt 中显式列出盲区单元，要求结论坦诚告知边界 + 给下一步指引 + 不编造。
     """
 
     def final_answer(state: TurnState) -> dict[str, Any]:
-        evidence = state.get("evidence", [])
         table = CoverageTable.from_dict(state.get("coverage"))
+        # 盲区标记：穷尽候选源仍 REMAINING 的单元落 BLIND_SPOT（一等状态）。final_answer 是
+        # 唯一终止点，故覆盖完成 / 安全阀 / 穷尽三条路径到达时统一标记。
+        table.mark_blind_spots()
+        evidence = state.get("evidence", [])
         prompt = _render_evidence_prompt(state["rewritten_query"], evidence, table)
         response: AIMessage = models.strong.invoke(
             [
@@ -374,6 +445,7 @@ def make_final_answer_node(models: Models) -> Callable[[TurnState], dict[str, An
             ]
         )
         return {
+            "coverage": table.as_dict(),
             "messages": [response],
             "final_reply": response.content or "",
         }
@@ -421,6 +493,27 @@ def route_after_core(state: TurnState) -> str:
     if getattr(last, "tool_calls", None):
         return "build_coverage"
     return "chat_flow_answer"
+
+
+def make_safety_route(
+    caps: SafetyCaps, next_node: str
+) -> Callable[[TurnState], str]:
+    """检索层/精修步后的条件路由：安全阀触顶 → 短路到 final_answer 兜底强制作答；否则 → 下一节点。
+
+    `next_node` 为正常推进的下一节点（如 refine_after_knowledge / retrieve_database 等）。
+    触发条件：tool_call_count >= max_tool_calls 或 iteration_count >= max_iterations（任一即兜底）。
+    """
+
+    def route(state: TurnState) -> str:
+        if safety_valve_tripped(
+            state.get("tool_call_count", 0),
+            state.get("iteration_count", 0),
+            caps,
+        ):
+            return "final_answer"
+        return next_node
+
+    return route
 
 
 def _query_one_unit(
@@ -525,10 +618,14 @@ def _render_evidence_prompt(
         lines.append("（暂无证据）")
 
     remaining = table.remaining_units
-    if remaining:
+    blind_spots = table.blind_spot_units
+    if remaining or blind_spots:
         lines.append("")
-        lines.append("仍未覆盖的信息单元（如无其他来源请坦诚说明边界）：")
-        lines.extend(f"- {u.need}" for u in remaining)
+        lines.append("仍未覆盖的信息单元（盲区，结论须坦诚告知边界并给下一步指引，绝不编造）：")
+        for u in remaining:
+            lines.append(f"- {u.need}")
+        for u in blind_spots:
+            lines.append(f"- [盲区] {u.need}（已穷尽知识库/数据库/联网候选源仍未查到）")
 
     # 隐性对比提示：当证据涉及多个可比实体（如两个专业各自的同类数据）时，引导产出对比分析
     # 而非并列罗列。判定为「多实体同类」即提示；对比意图的最终判定由模型依 query + 素材完成。

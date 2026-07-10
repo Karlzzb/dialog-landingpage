@@ -198,10 +198,10 @@ def test_blocked_external_item_dropped_no_evidence(test_settings):
 
     reply, state = invoke("ext-4", "某科技营收", graph=graph, settings=test_settings)
 
-    # 整条拦截 → 无 Evidence、单元落盲区。
+    # 整条拦截 → 无 Evidence、单元穷尽候选源后落盲区。
     assert not state.get("evidence")
     table = CoverageTable.from_dict(state["coverage"])
-    assert table.units[0].status == CoverageStatus.REMAINING
+    assert table.units[0].status == CoverageStatus.BLIND_SPOT
     # 结论仍产出人性化兜底，不外泄技术细节、不含被拦截的敏感原文。
     assert reply
     assert "严重违规内容" not in reply

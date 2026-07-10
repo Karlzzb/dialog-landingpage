@@ -23,6 +23,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        # 字段均带大写 alias（如 max_tool_calls → MAX_TOOL_CALLS）用于 .env / 环境变量；
+        # 同时允许用字段名构造（Settings(max_tool_calls=2)），便于测试注入。
+        populate_by_name=True,
     )
 
     # ── Agent 两档模型（共用 base_url + key，按角色切 model 名）──
@@ -51,6 +54,14 @@ class Settings(BaseSettings):
     redis_timeout: float = Field(default=10.0, alias="REDIS_TIMEOUT")
     # 会话记忆 TTL（分钟），可配置；占位默认值，待业务确认实际取值后覆盖。
     session_ttl_minutes: float = Field(default=60.0, alias="SESSION_TTL_MINUTES")
+
+    # ── loop 安全阀（切片 8）──
+    # 内核 loop 的两条硬上限，触发即兜底强制作答，防止死循环烧 token。
+    # 最大工具调用数（检索工具实际调用次数：知识库/数据库能力/联网）。初值 6，上线后按真实分布调。
+    max_tool_calls: int = Field(default=6, alias="MAX_TOOL_CALLS")
+    # 最大迭代步数（检索层 + 精修步的节点访问数）。初值 8；当前有界管线正常轮次≤5，
+    # 此阈值作为结构兜底，自由 ReAct 回边循环引入后才会自然触顶。
+    max_iterations: int = Field(default=8, alias="MAX_ITERATIONS")
 
     @property
     def has_model_credentials(self) -> bool:

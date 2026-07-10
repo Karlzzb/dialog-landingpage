@@ -4,6 +4,7 @@
 所需的结构化对象：覆盖度表、逐层累积的分源 Evidence、以及出口截断所依据的流别。
 切片 6 增设跨轮持久的 `session_memory`（结构化会话记忆，ADR 0003）——单轮字段每轮入口重置，
 仅会话记忆跨轮续接，故 LLM 不被喂全量对话历史。
+切片 8 增设安全阀计数（`tool_call_count` / `iteration_count`）：触顶即兜底强制作答。
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ class TurnState(TypedDict, total=False):
     coverage: dict[str, Any]
     # 逐层累积的分源 Evidence（ADR 0007，Evidence.as_dict）；operator.add 使各层追加不覆盖。
     evidence: Annotated[list[dict[str, Any]], operator.add]
+    # 安全阀计数（切片 8）：本轮检索工具实际调用次数 / 检索层+精修步的节点访问数。
+    # 触顶即经条件边短路到 final_answer 兜底强制作答，不死循环烧 token。阈值见 SafetyCaps。
+    tool_call_count: int
+    iteration_count: int
     # 本轮流别："chat"（对话流）/"knowledge"（知识流）；finalize 据此决定是否 ≤50 字截断。
     flow: str
     # 最终呈现给用户的回复。

@@ -34,10 +34,16 @@ SOURCE_PRIORITY: tuple[SourceType, ...] = (
 
 
 class CoverageStatus(str, Enum):
-    """单元覆盖状态。切片 2 用 REMAINING / COVERED 两态；盲区/降级态在后续切片引入。"""
+    """单元覆盖状态。
+
+    REMAINING / COVERED 是检索过程中的中间态；BLIND_SPOT 是 loop 终止时的一等状态
+    （切片 8）：某单元穷尽其全部候选数据源（知识库→数据库→联网三层）后仍未被覆盖，
+    即落入盲区——非异常，结论生成须坦诚告知边界并给下一步指引，绝不编造。
+    """
 
     REMAINING = "REMAINING"  # 仍缺失，需继续查询
     COVERED = "COVERED"  # 已被某数据源命中覆盖
+    BLIND_SPOT = "BLIND_SPOT"  # 穷尽候选源仍未覆盖（盲区，一等状态）
 
 
 # ── 内核首步产出覆盖度表的结构化工具 schema（绑定强模型）──
@@ -139,17 +145,29 @@ class CoverageTable:
 
     @property
     def remaining_units(self) -> list[InformationUnit]:
-        """仍缺失（未覆盖）的信息单元。归零即命中即停。"""
+        """仍缺失（未覆盖、且尚未判定为盲区）的信息单元。归零即命中即停。"""
         return [u for u in self.units if u.status == CoverageStatus.REMAINING]
 
     @property
     def is_complete(self) -> bool:
-        """全部信息单元均已覆盖。"""
+        """全部信息单元均已覆盖或已落入盲区（无待检索单元）。"""
         return not self.remaining_units
 
+    @property
+    def blind_spot_units(self) -> list[InformationUnit]:
+        """已穷尽候选源仍未覆盖的单元（盲区，一等状态，切片 8）。"""
+        return [u for u in self.units if u.status == CoverageStatus.BLIND_SPOT]
+
     def remaining_for_source(self, source: SourceType) -> list[InformationUnit]:
-        """当前层可尝试的单元：仍缺失且候选源包含该数据源。"""
-        return [u for u in self.remaining_units if source in u.source_matches]
+        """当前层可尝试的单元：仍缺失（REMAINING）且候选源包含该数据源。
+
+        盲区单元（BLIND_SPOT）已穷尽其候选源，不再被任何层重复尝试。
+        """
+        return [
+            u
+            for u in self.remaining_units
+            if source in u.source_matches
+        ]
 
     # ── 覆盖度更新 ──
 
@@ -161,6 +179,20 @@ class CoverageTable:
                 unit.citations = list(citations)
                 return
         raise KeyError(f"覆盖度表中不存在信息单元：{unit_id}")
+
+    def mark_blind_spots(self) -> list[InformationUnit]:
+        """把所有仍缺失（REMAINING）的单元标记为盲区（BLIND_SPOT），返回这些单元。
+
+        在 loop 终止时调用（final_answer 入口）：无论从覆盖完成 / 安全阀 / 穷尽三条路径哪条
+        到达，仍 REMAINING 的单元都意味着其候选源已穷尽而未命中，落入盲区这一一等状态。
+        结论生成据此坦诚告知边界并给下一步指引，绝不编造。
+        """
+        newly_blind: list[InformationUnit] = []
+        for unit in self.units:
+            if unit.status == CoverageStatus.REMAINING:
+                unit.status = CoverageStatus.BLIND_SPOT
+                newly_blind.append(unit)
+        return newly_blind
 
     # ── 动态精修：随观察补充新单元 / 修正数据源匹配（ADR 0002）──
 

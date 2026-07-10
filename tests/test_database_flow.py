@@ -191,9 +191,9 @@ def test_injection_param_degrades_to_blind_spot(test_settings):
 
     # 注入被拒 → 后端从未执行（run_query 未被触达）。
     assert backend.calls == []
-    # 该单元仍缺失（盲区），无数据库 Evidence。
+    # 该单元穷尽候选源仍未覆盖 → 落盲区（一等状态），无数据库 Evidence。
     table = CoverageTable.from_dict(state["coverage"])
-    assert table.units[0].status == CoverageStatus.REMAINING
+    assert table.units[0].status == CoverageStatus.BLIND_SPOT
     assert not state.get("evidence")
     # 结论仍产出人性化兜底，不外泄技术堆栈。
     assert reply
@@ -228,5 +228,5 @@ def test_no_matching_capability_degrades(test_settings):
 
     assert backend.calls == []
     table = CoverageTable.from_dict(state["coverage"])
-    assert table.units[0].status == CoverageStatus.REMAINING
+    assert table.units[0].status == CoverageStatus.BLIND_SPOT
     assert not state.get("evidence")
