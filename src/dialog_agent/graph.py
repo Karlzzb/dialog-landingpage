@@ -9,12 +9,16 @@
 精修步（`refine_after_knowledge` / `refine_after_database`）随观察补充新单元 / 修正数据源匹配
 （ADR 0002 动态特性），补出的单元由后续层自然拾取；命中即停（`remaining_units==0`）时精修步
 早退、不调 LLM。图对 `Models`、知识库检索器 `KnowledgeRetriever`、数据库工具 `DatabaseTool`、
-联网工具 `WebSearchTool` 依赖注入，可用桩确定性驱动全图；持久化用内存版 MemorySaver（Redis 版
-见切片 7）。
+联网工具 `WebSearchTool` 依赖注入，可用桩确定性驱动全图。
+
+切片 7：默认 checkpointer 由内存版 `MemorySaver` 切为 Redis 版 `RedisSaver`——`.env` 配了 Redis
+host 即用 Redis 持久化整个 State（`thread_id = session_id`、会话记忆带可配置 TTL、checkpointer db
+与业务隔离）；本地无 Redis / 连接失败时优雅降级回 `MemorySaver`，不阻塞主体与测试。
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -38,8 +42,30 @@ from .nodes import (
     route_after_core,
 )
 from .observability import build_langfuse_callbacks
+from .persistence import build_redis_checkpointer
 from .state import TurnState
 from .web_search_tool import WebSearchTool, build_default_web_search_tool
+
+logger = logging.getLogger(__name__)
+
+
+def _build_default_checkpointer(settings: Settings) -> Any:
+    """默认 checkpointer：配了 Redis host 即用 Redis 版；否则 / 连接失败降级内存版。
+
+    生产环境应有可达的 Redis Stack（RedisSaver 需 RedisJSON + RediSearch）。Redis 不可达时降级
+    回 `MemorySaver` 仅作本地开发/测试兜底，不阻塞主体；该路径不进生产（生产会因 Redis 不可用
+    在 invoke 时失败，不应静默降级丢持久化——但此处降级保的是「图能编出来」，invoke 的可达性
+    由部署环境保证）。
+    """
+    if not settings.has_redis_config:
+        return MemorySaver()
+    try:
+        return build_redis_checkpointer(settings)
+    except Exception as exc:  # noqa: BLE001 —— 降级兜底，不阻断图编译。
+        logger.warning(
+            "Redis checkpointer 初始化失败，降级为内存版（会话不跨进程持久化）：%s", exc
+        )
+        return MemorySaver()
 
 
 def build_graph(
@@ -49,6 +75,7 @@ def build_graph(
     database_tool: DatabaseTool | None = None,
     web_search_tool: WebSearchTool | None = None,
     checkpointer: Any | None = None,
+    settings: Settings | None = None,
 ):
     """组装并编译对话图。
 
@@ -57,13 +84,16 @@ def build_graph(
     database_tool：参数化查询能力集（省略则用内置能力 + 假后端打桩，真实只读库到位后替换后端）。
     web_search_tool：联网工具（省略则用假后端 + 默认空词表过滤器打桩，真实检索后端/合规词表
         到位后注入）。
-    checkpointer：跨轮持久化（省略则用内存版 MemorySaver）。
+    checkpointer：跨轮持久化（省略则按 settings 用 RedisSaver，配了 Redis host 即 Redis 持久化，
+        否则/连接失败降级 MemorySaver；切片 7）。
+    settings：配置（省略则用进程单例，用于决定默认 checkpointer 与 Langfuse tracing）。
     """
+    settings = settings or get_settings()
     models = models or build_models()
     knowledge_retriever = knowledge_retriever or FakeKnowledgeRetriever()
     database_tool = database_tool or build_default_database_tool()
     web_search_tool = web_search_tool or build_default_web_search_tool()
-    checkpointer = checkpointer or MemorySaver()
+    checkpointer = checkpointer or _build_default_checkpointer(settings)
 
     builder = StateGraph(TurnState)
     builder.add_node("rewrite", make_rewrite_node(models))

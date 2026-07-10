@@ -2,6 +2,8 @@
 
 - Agent 两档模型共用同一 OpenAI 兼容 base_url + key，按角色切 model 名。
 - Langfuse tracing 凭据可选：缺失时 tracing 关闭，不影响图行为。
+- Redis checkpointer 凭据（切片 7）：连接参数取值参考 `redis.conf`，但一律经 .env 注入、
+  不写死、不进版本库；checkpointer 用的 `database` 索引与业务用途隔离（ADR/切片 7）。
 真实值由用户在 .env 填写（见 .env.example）；测试环境注入桩，不依赖此配置。
 """
 
@@ -34,6 +36,22 @@ class Settings(BaseSettings):
     langfuse_public_key: str | None = Field(default=None, alias="LANGFUSE_PUBLIC_KEY")
     langfuse_base_url: str | None = Field(default=None, alias="LANGFUSE_BASE_URL")
 
+    # ── Redis checkpointer（跨轮持久化整个 State，ADR/切片 7）──
+    # 连接参数取值参考 redis.conf（host/port/password/database/timeout/ssl），
+    # 真实值经 .env 注入。会话隔离仅靠 thread_id=session_id 唯一性（ADR 0005）。
+    redis_host: str | None = Field(default=None, alias="REDIS_HOST")
+    redis_port: int = Field(default=6379, alias="REDIS_PORT")
+    redis_password: str | None = Field(default=None, alias="REDIS_PASSWORD")
+    # 通用业务 db（redis.conf 的 database=4）；checkpointer 不用此 db。
+    redis_db: int = Field(default=4, alias="REDIS_DB")
+    # checkpointer 专用 db 索引，须与业务 db（REDIS_DB）隔离，避免会话状态与其他用途串台。
+    redis_checkpointer_db: int = Field(default=0, alias="REDIS_CHECKPOINTER_DB")
+    redis_ssl: bool = Field(default=False, alias="REDIS_SSL")
+    # 秒；对应 redis.conf 的 timeout（10000ms）。
+    redis_timeout: float = Field(default=10.0, alias="REDIS_TIMEOUT")
+    # 会话记忆 TTL（分钟），可配置；占位默认值，待业务确认实际取值后覆盖。
+    session_ttl_minutes: float = Field(default=60.0, alias="SESSION_TTL_MINUTES")
+
     @property
     def has_model_credentials(self) -> bool:
         return bool(self.model_base_url and self.model_api_key)
@@ -45,6 +63,11 @@ class Settings(BaseSettings):
             and self.langfuse_public_key
             and self.langfuse_base_url
         )
+
+    @property
+    def has_redis_config(self) -> bool:
+        """是否配置了 Redis host（据此决定默认 checkpointer 用 Redis 还是内存版）。"""
+        return bool(self.redis_host)
 
 
 @lru_cache(maxsize=1)
